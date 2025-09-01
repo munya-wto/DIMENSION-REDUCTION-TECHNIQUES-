@@ -1,6 +1,6 @@
 
 ---
-title: "Data Quality Checks Across Datasets"
+title: "Exploratory Data Analysis"
 author: "2555479 Munyaradzi Ndumeya"
 date: "2025-08-27"
 output:
@@ -200,3 +200,4 @@ for (nm in names(loaded_data)) {
   print(p)
 }
 ```
+
