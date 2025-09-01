@@ -1,0 +1,1 @@
+This work is intended for academic and research purposes only. You are welcome to read, reference, or build upon this work, but direct copying, redistribution, or commercial use is not permitted without permission.
