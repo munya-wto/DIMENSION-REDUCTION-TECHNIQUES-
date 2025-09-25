@@ -1,0 +1,496 @@
+
+---
+title: "Dimensionality Reduction Methods: PCA vs sPLS + Logistic Regression"
+author: "2555479 Munyaradzi Ndumeya"
+date: "2025-09-14"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+# 0) Clear Workspace
+```{r}
+rm(list = ls(all.names = TRUE), .history)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, results = 'hold')
+set.seed(1996)
+```
+
+
+# 1) Packages
+
+```{r libraries}
+library(GEOquery)
+library(caret)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(mixOmics)
+library(DMwR)
+library(sva)
+library(tidyr)
+library(sda)
+library(kableExtra)
+set.seed(1996)
+```
+
+# 2) Load GEO datasets
+
+```{r load_data}
+load_GEO_dataset <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)
+  pheno <- pData(gse)
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  tissue_col <- grep("tissue|characteristics|source|description", colnames(pheno),
+                     ignore.case = TRUE, value = TRUE)[1]
+  
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case = TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case = TRUE), "Normal", NA))
+  labels <- factor(labels, levels = c("Normal", "Tumor"))
+  
+  list(expr = expr, pheno = pheno, labels = labels)
+}
+
+datasets <- list(
+  Lung    = "GSE19804",
+  Breast  = "GSE15852",
+  Liver   = "GSE112790",
+  Gastric = "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+# 3) Preprocessing Pipeline
+
+```{r preprocessing}
+library(DMwR)  # for SMOTE
+set.seed(1996)
+split_data <- list()
+
+for (nm in names(loaded_data)) {
+  cat("\n=== Processing dataset:", nm, "===\n")
+  
+  X <- loaded_data[[nm]]$expr   # genes x samples
+  y <- loaded_data[[nm]]$labels
+  
+  # ---------------- Train/test split ----------------
+  train_idx <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[, train_idx, drop = FALSE]
+  X_test  <- X[, -train_idx, drop = FALSE]
+  y_train <- y[train_idx]
+  y_test  <- y[-train_idx]
+  
+  # ---------------- Variance filtering ----------------
+  vars <- apply(X_train, 1, var)
+  keep_genes <- vars > quantile(vars, 0.2)
+  X_train <- X_train[keep_genes, , drop = FALSE]
+  X_test  <- X_test[keep_genes, , drop = FALSE]
+  
+  # ---------------- Balancing with SMOTE ----------------
+  df_train <- data.frame(t(X_train), Class = factor(y_train))
+  if (any(table(df_train$Class) < max(table(df_train$Class)))) {
+    df_bal <- DMwR::SMOTE(Class ~ ., data = df_train, perc.over = 200, perc.under = 150)
+  } else {
+    df_bal <- df_train
+  }
+  
+  X_train <- t(as.matrix(df_bal[, -ncol(df_bal)]))
+  y_train <- df_bal$Class
+  
+  # ---------------- Batch correction ----------------
+  pheno_train <- loaded_data[[nm]]$pheno[colnames(X_train), , drop = FALSE]
+  pheno_test  <- loaded_data[[nm]]$pheno[colnames(X_test), , drop = FALSE]
+  
+  if (!is.null(pheno_train$batch) && length(unique(pheno_train$batch)) > 1) {
+    mod_train <- model.matrix(~1, pheno_train)
+    X_train <- ComBat(dat = X_train, batch = pheno_train$batch,
+                      mod = mod_train, par.prior = TRUE, prior.plots = FALSE)
+    if (!is.null(pheno_test$batch)) {
+      X_test <- ComBat(dat = X_test, batch = pheno_test$batch,
+                       mod = mod_train, par.prior = TRUE, prior.plots = FALSE,
+                       ref.batch = pheno_train$batch[1])
+    }
+  }
+  
+  # ---------------- Z-score scaling (train stats applied to test) ----------------
+  X_train_sc <- scale(t(X_train), center = TRUE, scale = TRUE)  # samples x genes
+  sc_par <- attr(X_train_sc, "scaled:center")
+  sc_sds <- attr(X_train_sc, "scaled:scale")
+  X_test_sc <- scale(t(X_test), center = sc_par, scale = sc_sds)
+  
+  # transpose back to genes x samples if you prefer that format
+  X_train_sc <- t(X_train_sc)
+  X_test_sc  <- t(X_test_sc)
+  
+  # ---------------- Save ----------------
+  split_data[[nm]] <- list(
+    train_expr = X_train_sc,
+    test_expr  = X_test_sc,
+    train_labels = y_train,
+    test_labels  = y_test
+  )
+}
+
+```
+# 4) Metrics function
+
+```{r metrics}
+get_metrics <- function(cm, roc_obj, positive="Tumor") {
+  cm_tab <- cm$table
+  TP <- cm_tab[positive, positive]
+  FN <- sum(cm_tab[positive, ]) - TP
+  FP <- sum(cm_tab[, positive]) - TP
+  TN <- sum(cm_tab) - TP - FN - FP
+  
+  precision <- ifelse((TP + FP) > 0, TP / (TP + FP), 0)
+  recall    <- ifelse((TP + FN) > 0, TP / (TP + FN), 0)
+  F1        <- ifelse((precision + recall) > 0, 2 * precision * recall / (precision + recall), 0)
+  specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), 0)
+  den <- sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+  MCC <- ifelse(den > 0, (TP*TN - FP*FN)/den, 0)
+  
+  data.frame(
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Kappa = as.numeric(cm$overall["Kappa"]),
+    Sensitivity = recall,
+    Specificity = specificity,
+    Precision = precision,
+    Balanced_Accuracy = (recall + specificity)/2,
+    MCC = MCC,
+    F1_Score = F1,
+    AUC = as.numeric(auc(roc_obj))
+  )
+}
+```
+
+
+# 4) PCA + Logistic Regression
+
+```{r pca_workflow}
+results_list <- list()
+
+for (dname in names(split_data)) {
+  
+  cat("\n=== Dataset:", dname, "===\n")
+  
+  x_train_sc <- split_data[[dname]]$train_expr  # genes x samples
+  x_test_sc  <- split_data[[dname]]$test_expr
+  y_train <- split_data[[dname]]$train_labels
+  y_test  <- split_data[[dname]]$test_labels
+  
+  # ---------------- PCA ----------------
+  # Transpose: samples x genes
+  x_train_pca <- t(x_train_sc)
+  x_test_pca  <- t(x_test_sc)
+  
+  # Ensure column names match for predict()
+  colnames(x_test_pca) <- colnames(x_train_pca)
+  
+  pca <- prcomp(x_train_pca, center = FALSE, scale. = FALSE)
+  cumv <- cumsum(pca$sdev^2 / sum(pca$sdev^2))
+  num_pcs <- min(which(cumv >= 0.95))
+  cat("PCs for >=95% variance:", num_pcs, "\n")
+  
+  train_pcs <- pca$x[, 1:num_pcs, drop = FALSE]
+  test_pcs  <- predict(pca, newdata = x_test_pca)[, 1:num_pcs, drop = FALSE]
+  
+  # Select significant PCs via univariate logistic
+  p_vals <- sapply(1:ncol(train_pcs), function(i)
+    summary(glm(y_train ~ train_pcs[,i], family = binomial))$coefficients[2,4])
+  sig_pcs <- which(p.adjust(p_vals, method = "fdr") < 0.05)
+  if (length(sig_pcs) == 0) sig_pcs <- 1:min(3, ncol(train_pcs))
+  cat("Significant PCs:", paste(sig_pcs, collapse = ", "), "\n")
+  
+  df_train_pca <- as.data.frame(train_pcs[, sig_pcs, drop = FALSE])
+  df_train_pca$Status <- y_train
+  pca_lr <- glm(Status ~ ., data = df_train_pca, family = binomial)
+  
+  df_test_pca <- as.data.frame(test_pcs[, sig_pcs, drop = FALSE])
+  prob_pca <- predict(pca_lr, newdata = df_test_pca, type = "response")
+  pred_pca <- factor(ifelse(prob_pca > 0.5, "Tumor", "Normal"), levels = levels(y_test))
+  cm_pca <- confusionMatrix(pred_pca, y_test, positive = "Tumor")
+  roc_pca <- roc(response = y_test, predictor = prob_pca, levels = rev(levels(y_test)))
+  
+  metrics_pca <- get_metrics(cm_pca, roc_pca)
+  metrics_pca$Dataset <- dname
+  metrics_pca$Method <- "PCA"
+  
+  # ---------------- sPLS ----------------
+  y_train_num <- as.numeric(y_train) - 1
+  K <- 5
+  eta <- 0.2
+  keepX <- rep(max(5, floor(ncol(x_train_sc) * eta)), K)
+  
+  spls_model <- spls(X = t(x_train_sc), Y = y_train_num, ncomp = K, keepX = keepX)
+  train_spls <- spls_model$variates$X
+  test_spls <- t(x_test_sc) %*% spls_model$loadings$X
+  
+  p_vals_spls <- sapply(1:ncol(train_spls), function(i)
+    summary(glm(y_train ~ train_spls[,i], family = binomial))$coefficients[2,4])
+  sig_spls <- which(p.adjust(p_vals_spls, method = "fdr") < 0.05)
+  if (length(sig_spls) == 0) sig_spls <- 1:min(3, ncol(train_spls))
+  cat("Significant sPLS components:", paste(sig_spls, collapse = ", "), "\n")
+  
+  df_train_spls <- as.data.frame(train_spls[, sig_spls, drop = FALSE])
+  df_train_spls$Status <- y_train
+  spls_lr <- glm(Status ~ ., data = df_train_spls, family = binomial)
+  
+  df_test_spls <- as.data.frame(test_spls[, sig_spls, drop = FALSE])
+  prob_spls <- predict(spls_lr, newdata = df_test_spls, type = "response")
+  pred_spls <- factor(ifelse(prob_spls > 0.5, "Tumor", "Normal"), levels = levels(y_test))
+  cm_spls <- confusionMatrix(pred_spls, y_test, positive = "Tumor")
+  roc_spls <- roc(response = y_test, predictor = prob_spls, levels = rev(levels(y_test)))
+  
+  metrics_spls <- get_metrics(cm_spls, roc_spls)
+  metrics_spls$Dataset <- dname
+  metrics_spls$Method <- "sPLS"
+  
+  # ---------------- Save results ----------------
+  results_list[[dname]] <- list(PCA = metrics_pca, sPLS = metrics_spls)
+}
+
+
+```
+
+
+
+
+# ------------------------
+# Create summary table
+# ------------------------
+```{r summary_results}
+
+create_summary_table <- function(results_list) {
+  summary_data <- data.frame()
+  
+  for (dataset_name in names(results_list)) {
+    for (method_name in c("PCA", "sPLS")) {
+      metrics <- results_list[[dataset_name]][[method_name]]
+      summary_data <- rbind(summary_data, metrics)
+    }
+  }
+  return(summary_data)
+}
+
+create_global_ranking <- function(summary_data) {
+  summary_data %>%
+    group_by(Method) %>%
+    summarise(
+      Mean_Accuracy = mean(Accuracy),
+      Mean_AUC = mean(AUC),
+      Mean_F1 = mean(F1_Score),
+      Mean_Specificity = mean(Specificity),
+      Mean_Sensitivity = mean(Sensitivity)
+    ) %>%
+    mutate(
+      Accuracy_Rank = rank(-Mean_Accuracy),
+      AUC_Rank = rank(-Mean_AUC),
+      F1_Rank = rank(-Mean_F1),
+      Specificity_Rank = rank(-Mean_Specificity),
+      Overall_Rank = (Accuracy_Rank + AUC_Rank + F1_Rank + Specificity_Rank)/4
+    ) %>%
+    arrange(Overall_Rank)
+}
+
+summary_table <- create_summary_table(results_list)
+global_ranking <- create_global_ranking(summary_table)
+
+# Print tables
+kable(summary_table, digits = 3, caption = "Performance Metrics: PCA vs sPLS") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+kable(global_ranking, digits = 3, caption = "Overall Performance Ranking") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+pca_scree_df <- bind_rows(
+  lapply(names(split_data), function(dname) {
+    pca_obj <- prcomp(split_data[[dname]]$train_expr, center = FALSE, scale. = FALSE)
+    varex <- pca_obj$sdev^2 / sum(pca_obj$sdev^2)
+    cumv <- cumsum(varex)
+    num_pcs <- min(which(cumv >= 0.95))
+    data.frame(
+      Dataset = dname,
+      PC = 1:length(varex),
+      Variance = varex,
+      Cumulative = cumv,
+      Selected = ifelse(1:length(varex) <= num_pcs, "Selected", "Not Selected")
+    )
+  })
+)
+
+ggplot(pca_scree_df, aes(x = PC, y = Cumulative, color = Selected)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(data = pca_scree_df %>% group_by(Dataset) %>% summarise(num_pc = max(PC[Selected=="Selected"])),
+             aes(xintercept = num_pc), linetype = "dashed", color = "red") +
+  facet_wrap(~Dataset, scales = "free_x") +
+  ylim(0,1) +
+  labs(title = "PCA Scree Plots (Cumulative Variance)", x = "Principal Component", y = "Cumulative Variance Explained") +
+  theme_minimal() +
+  scale_color_manual(values = c("Selected" = "blue", "Not Selected" = "gray"))
+
+```
+```{r sPLS SCREE}
+library(ggplot2)
+library(dplyr)
+
+# Create sPLS dataframe (samples x genes)
+spls_df <- bind_rows(
+  lapply(names(split_data), function(dname) {
+    X_train <- t(split_data[[dname]]$train_expr)  # samples x genes
+    y_train_num <- as.numeric(split_data[[dname]]$train_labels) - 1
+
+    K <- 5
+    eta <- 0.2
+    keepX <- rep(max(5, floor(ncol(X_train) * eta)), K)
+
+    spls_model <- spls(X = X_train, Y = y_train_num, ncomp = K, keepX = keepX)
+
+    cov_spls <- apply(spls_model$variates$X, 2, function(z) abs(cov(z, y_train_num)))
+    cum_cov <- cumsum(cov_spls) / sum(cov_spls)
+    k95 <- min(which(cum_cov >= 0.95))
+
+    data.frame(
+      Dataset = dname,
+      Component = 1:length(cov_spls),
+      Importance = cov_spls,
+      Cumulative = cum_cov,
+      Selected = ifelse(1:length(cov_spls) <= k95, "Selected", "Not Selected")
+    )
+  })
+)
+
+# Plot sPLS scree
+ggplot(spls_df, aes(x = Component, y = Cumulative, color = Selected)) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "red") +
+  facet_wrap(~Dataset) +
+  labs(title = "sPLS Cumulative Covariance Scree Plot",
+       y = "Cumulative Covariance",
+       x = "Component") +
+  scale_color_manual(values = c("Selected" = "blue", "Not Selected" = "grey")) +
+  theme_minimal()
+
+```
+````{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+pca_scree_df <- bind_rows(
+  lapply(names(split_data), function(dname) {
+    pca_obj <- prcomp(split_data[[dname]]$train_expr, center = FALSE, scale. = FALSE)
+    varex <- pca_obj$sdev^2 / sum(pca_obj$sdev^2)
+    cumv <- cumsum(varex)
+    num_pcs <- min(which(cumv >= 0.95))
+    data.frame(
+      Dataset = dname,
+      PC = 1:length(varex),
+      Variance = varex,
+      Cumulative = cumv,
+      Selected = ifelse(1:length(varex) <= num_pcs, "Selected", "Not Selected")
+    )
+  })
+)
+
+# Create the scree plot with exact colors and formatting
+pca_plot <- ggplot(pca_scree_df, aes(x = PC, y = Cumulative)) +
+  geom_line(aes(color = Selected), size = 2.5, alpha = 0.9) +
+  geom_point(aes(color = Selected), size = 4) +
+  geom_vline(data = pca_scree_df %>% group_by(Dataset) %>% summarise(num_pc = max(PC[Selected=="Selected"])),
+             aes(xintercept = num_pc), linetype = "dashed", color = "#FF0000", size = 1.5) +
+  facet_wrap(~Dataset, scales = "free_x") +
+  ylim(0,1) +
+  labs(x = "Principal Component", y = "Cumulative Variance Explained") +
+  theme_minimal() +
+  scale_color_manual(values = c("Selected" = "#000080", "Not Selected" = "gray50")) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(face = "bold", size = 12, color = "black"),
+    axis.text = element_text(face = "bold", size = 10, color = "black"),
+    strip.text = element_text(face = "bold", size = 11, color = "black"),
+    legend.position = "none", # Remove legend as requested
+    panel.grid.major = element_line(color = "gray50", size = 0.3),
+    panel.grid.minor = element_line(color = "gray70", size = 0.2)
+  )
+
+# Save to PDF
+pdf("PCA_Scree_Plots_Formatted.pdf", width = 12, height = 8, pointsize = 14)
+print(pca_plot)
+dev.off()
+
+cat("PCA Scree Plots PDF saved as 'PCA_Scree_Plots_Formatted.pdf'\n")
+
+# Display the plot
+print(pca_plot)
+````
+
+````{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+pca_scree_df <- bind_rows(
+  lapply(names(split_data), function(dname) {
+    pca_obj <- prcomp(split_data[[dname]]$train_expr, center = FALSE, scale. = FALSE)
+    varex <- pca_obj$sdev^2 / sum(pca_obj$sdev^2)
+    cumv <- cumsum(varex)
+    num_pcs <- min(which(cumv >= 0.95))
+    data.frame(
+      Dataset = dname,
+      PC = 1:length(varex),
+      Variance = varex,
+      Cumulative = cumv,
+      Selected = ifelse(1:length(varex) <= num_pcs, "Selected", "Not Selected")
+    )
+  })
+)
+
+# Create the scree plot with exact colors and formatting
+pca_plot <- ggplot(pca_scree_df, aes(x = PC, y = Cumulative)) +
+  geom_line(aes(color = Selected), size = 2.5, alpha = 0.9) +
+  geom_point(aes(color = Selected), size = 4) +
+  geom_vline(data = pca_scree_df %>% group_by(Dataset) %>% summarise(num_pc = max(PC[Selected=="Selected"])),
+             aes(xintercept = num_pc), linetype = "dashed", color = "#FF0000", size = 1.5) +
+  facet_wrap(~Dataset, scales = "free_x") +
+  ylim(0,1) +
+  labs(x = "Principal Component", y = "Cumulative Variance Explained") +
+  theme_minimal() +
+  scale_color_manual(values = c("Selected" = "#000080", "Not Selected" = "gray50")) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(face = "bold", size = 36, color = "black"), # 3x larger (12 → 36)
+    axis.text = element_text(face = "bold", size = 30, color = "black"),  # 3x larger (10 → 30)
+    strip.text = element_text(face = "bold", size = 33, color = "black"), # 3x larger (11 → 33)
+    legend.position = "none", # Remove legend as requested
+    panel.grid.major = element_line(color = "gray50", size = 0.3),
+    panel.grid.minor = element_line(color = "gray70", size = 0.2)
+  )
+
+# Save to PDF
+pdf("PCA_Scree_Plots_Formatted.pdf", width = 12, height = 8, pointsize = 14)
+print(pca_plot)
+dev.off()
+
+cat("PCA Scree Plots PDF saved as 'PCA_Scree_Plots_Formatted.pdf'\n")
+
+# Display the plot
+print(pca_plot)
+````
+
+
+
+
+
