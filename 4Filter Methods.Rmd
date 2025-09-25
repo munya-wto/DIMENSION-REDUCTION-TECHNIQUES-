@@ -1,0 +1,741 @@
+
+---
+title: "FILTER METHODS: mRMR vs Chi-Squared Feature Selection"
+author: "2555479 Munyaradzi Ndumeya"
+date: "2025-08-20"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+
+# OPTIONAL ::: To clear the entire history
+````{r}
+rm(list = ls(all.names = TRUE), .history)
+````
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, results = 'hold')
+set.seed(1996)
+```
+
+# 0) Packages
+
+```{r libraries}
+library(GEOquery)
+library(caret)
+library(glmnet)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tibble)
+library(smotefamily)
+library(gridExtra)
+library(sva)
+library(patchwork)
+library(kableExtra)
+library(tidyr)
+library(mRMRe)
+set.seed(1996)
+```
+
+# 1) Load & Label GEO Datasets
+
+```{r load_data}
+options(timeout = 60000)
+load_GEO_dataset <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)
+  pheno <- pData(gse)
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  tissue_col <- grep("tissue|characteristics|source|description", colnames(pheno),
+                     ignore.case = TRUE, value = TRUE)[1]
+  
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case = TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case = TRUE), "Normal", NA))
+  labels <- factor(labels, levels = c("Normal", "Tumor"))
+  
+  list(expr = expr, pheno = pheno, labels = labels)
+}
+
+datasets <- list(
+  Lung    = "GSE19804",
+  Breast  = "GSE15852",
+  Liver   = "GSE112790",
+  Gastric = "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+# 2) Preprocessing Pipeline
+
+```{r preprocessing}
+library(DMwR)  # for SMOTE
+set.seed(1996)
+split_data <- list()
+
+for (nm in names(loaded_data)) {
+  cat("\n=== Processing dataset:", nm, "===\n")
+  
+  X <- loaded_data[[nm]]$expr
+  y <- loaded_data[[nm]]$labels
+  
+  # Train/test split
+  train_idx <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[, train_idx, drop = FALSE]
+  X_test  <- X[, -train_idx, drop = FALSE]
+  y_train <- y[train_idx]
+  y_test  <- y[-train_idx]
+  
+  # Variance filtering
+  vars <- apply(X_train, 1, var)
+  keep_genes <- vars > quantile(vars, 0.2)
+  X_train <- X_train[keep_genes, , drop = FALSE]
+  X_test  <- X_test[keep_genes, , drop = FALSE]
+  
+  # Balancing with DMwR::SMOTE
+  df_train <- data.frame(t(X_train), Class = y_train)
+  df_train$Class <- as.factor(df_train$Class)
+  
+  if (any(table(df_train$Class) < max(table(df_train$Class)))) {
+    df_bal <- DMwR::SMOTE(Class ~ ., data = df_train, perc.over = 200, perc.under = 150)
+  } else {
+    df_bal <- df_train
+  }
+  
+  X_train <- t(as.matrix(df_bal[, -ncol(df_bal)]))
+  y_train <- df_bal$Class
+  
+  # Batch correction (same as before)
+  pheno_train <- loaded_data[[nm]]$pheno[colnames(X_train), , drop = FALSE]
+  pheno_test  <- loaded_data[[nm]]$pheno[colnames(X_test), , drop = FALSE]
+  if (!is.null(pheno_train$batch) && length(unique(pheno_train$batch)) > 1) {
+    mod_train <- model.matrix(~1, pheno_train)
+    X_train <- ComBat(dat = X_train, batch = pheno_train$batch,
+                      mod = mod_train, par.prior = TRUE, prior.plots = FALSE)
+    if (!is.null(pheno_test$batch)) {
+      X_test <- ComBat(dat = X_test, batch = pheno_test$batch,
+                       mod = mod_train, par.prior = TRUE, prior.plots = FALSE,
+                       ref.batch = pheno_train$batch[1])
+    }
+  }
+  
+  split_data[[nm]] <- list(
+    train_expr = X_train,
+    test_expr  = X_test,
+    train_labels = y_train,
+    test_labels  = y_test
+  )
+}
+
+```
+
+
+# 2) Utilities — Metrics & Discretization
+
+```{r utilities}
+get_metrics <- function(cm, roc_obj, positive = "Tumor") { 
+  cm_tab <- cm$table 
+  TP <- cm_tab[positive, positive] 
+  FN <- sum(cm_tab[positive, ]) - TP 
+  FP <- sum(cm_tab[, positive]) - TP 
+  TN <- sum(cm_tab) - TP - FN - FP 
+   
+  # --- Metrics from confusion matrix ---
+  precision <- ifelse((TP + FP) > 0, TP / (TP + FP), 0) 
+  recall    <- ifelse((TP + FN) > 0, TP / (TP + FN), 0) 
+  F1        <- ifelse((precision + recall) > 0, 
+                      2 * precision * recall / (precision + recall), 0) 
+  specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), 0)
+  neg_pred_value <- ifelse((TN + FN) > 0, TN / (TN + FN), 0)
+  
+  # --- MCC ---
+  den <- sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN)) 
+  MCC <- ifelse(den > 0, ((TP*TN - FP*FN) / den), 0) 
+   
+  data.frame( 
+    Accuracy          = as.numeric(cm$overall["Accuracy"]), 
+    Kappa             = as.numeric(cm$overall["Kappa"]), 
+    Sensitivity       = recall, 
+    Specificity       = specificity, 
+    Precision         = precision, 
+    `Neg Pred Value`  = neg_pred_value, 
+    Balanced_Accuracy = (recall + specificity) / 2, 
+    MCC               = MCC, 
+    AUC               = as.numeric(auc(roc_obj)), 
+    F1_Score          = F1 
+  ) 
+} 
+ 
+discretize_df <- function(df, bins = 3) { 
+  as.data.frame(lapply(as.data.frame(df), function(col)  
+    cut(col, breaks = bins, labels = FALSE, include.lowest = TRUE))) 
+} 
+```
+
+
+# 3) Chi-Square With Cross-Validation
+
+```{r chi_square_cv}
+chi_square_cv <- function(x_train, y_train, top_n = 50, cv_folds = 5, bins = 3, seed = 1996) { 
+  set.seed(seed) 
+  # Ensure labels are factors
+  y_train <- factor(y_train)
+  
+  folds <- createFolds(y_train, k = cv_folds, list = TRUE, returnTrain = TRUE) 
+  results <- list(metrics = data.frame(), features_per_fold = vector("list", length(folds))) 
+   
+  for (i in seq_along(folds)) { 
+    cat("Chi-Square — Fold", i, "\n") 
+    tr_idx <- folds[[i]]; te_idx <- setdiff(seq_along(y_train), tr_idx) 
+    Xtr <- x_train[tr_idx, , drop = FALSE]; ytr <- factor(y_train[tr_idx]) 
+    Xte <- x_train[te_idx, , drop = FALSE]; yte <- factor(y_train[te_idx]) 
+     
+    # Drop near-zero variance predictors
+    nzv <- nearZeroVar(Xtr)
+    if (length(nzv) > 0) {
+      Xtr <- Xtr[, -nzv, drop = FALSE]
+      Xte <- Xte[, -nzv, drop = FALSE]
+    }
+     
+    # Discretize for Chi-square 
+    Xtr_disc <- discretize_df(Xtr, bins) 
+    pvals <- sapply(names(Xtr_disc), function(f) { 
+      tbl <- table(Xtr_disc[[f]], ytr) 
+      if (any(dim(tbl) < 2)) return(NA) 
+      suppressWarnings(chisq.test(tbl)$p.value) 
+    }) 
+    pvals <- pvals[!is.na(pvals)]  # drop invalid ones
+    
+    if (length(pvals) == 0) { 
+      warning(paste("Fold", i, ": no valid features, skipping Chi-Square")) 
+      next 
+    }
+     
+    ranking <- sort(pvals, decreasing = FALSE) 
+    top_feats <- names(ranking)[1:min(top_n, length(ranking))] 
+    top_feats <- intersect(top_feats, colnames(Xtr)) 
+    results$features_per_fold[[i]] <- top_feats 
+     
+    # Model & predictions (fallback: if no features, use intercept-only)
+    if (length(top_feats) == 0) {
+      prob <- rep(mean(ytr == levels(ytr)[2]), length(yte))
+    } else {
+      tr_df <- as.data.frame(Xtr[, top_feats, drop = FALSE]); tr_df$Class <- ytr 
+      mdl <- glm(Class ~ ., data = tr_df, family = binomial) 
+      te_df <- as.data.frame(Xte[, top_feats, drop = FALSE]) 
+      prob <- predict(mdl, newdata = te_df, type = "response") 
+    }
+    pred <- factor(ifelse(prob > 0.5, levels(y_train)[2], levels(y_train)[1]), 
+                   levels = levels(y_train)) 
+     
+    cm <- confusionMatrix(pred, yte, positive = levels(y_train)[2]) 
+    roc_obj <- roc(response = yte, predictor = prob, levels = rev(levels(yte))) 
+    fold_metrics <- get_metrics(cm, roc_obj) 
+    results$metrics <- rbind(results$metrics, cbind(Fold = i, fold_metrics)) 
+  } 
+   
+  if (nrow(results$metrics) > 0) {
+    results$mean_metrics <- colMeans(results$metrics[, -1, drop = FALSE], na.rm = TRUE) 
+  } else {
+    results$mean_metrics <- NA
+  }
+  results 
+} 
+
+```
+
+
+# 4) mRMR With Cross-Validation
+
+```{r mrmr_cv}
+mrmr_cv <- function(x_train, y_train, 
+                    top_features_per_chunk = 10, 
+                    final_num_features = 50, 
+                    chunk_size = 5000, 
+                    target_limit = 46340, 
+                    cv_folds = 5, seed = 1996) { 
+  set.seed(seed)
+  options(mRMRe.seed = seed)  # ensure reproducibility for mRMRe
+  
+  # Select features based on variance threshold
+  fvars <- apply(x_train, 2, var)
+  quantiles <- seq(0, 1, by = 0.001)
+  selected <- names(fvars)
+  for (q in quantiles) { 
+    cutoff <- quantile(fvars, probs = q) 
+    sel <- names(fvars)[fvars >= cutoff] 
+    if (length(sel) <= target_limit) { selected <- sel; break } 
+  }
+  
+  feature_chunks <- split(selected, ceiling(seq_along(selected) / chunk_size))
+  
+  folds <- createFolds(y_train, k = cv_folds, list = TRUE, returnTrain = TRUE)
+  results <- list(metrics = data.frame(), features_per_fold = vector("list", length(folds)))
+  
+  for (i in seq_along(folds)) { 
+    cat("mRMR — Fold", i, "\n") 
+    tr_idx <- folds[[i]]
+    te_idx <- setdiff(seq_along(y_train), tr_idx)
+    
+    Xtr <- x_train[tr_idx, selected, drop = FALSE]
+    ytr <- y_train[tr_idx]
+    Xte <- x_train[te_idx, selected, drop = FALSE]
+    yte <- y_train[te_idx]
+    
+    sel_from_chunks <- c()
+    for (chunk in feature_chunks) {
+      feats <- intersect(chunk, colnames(Xtr))
+      if (length(feats) < 2) next
+      dfc <- as.data.frame(Xtr[, feats, drop = FALSE])
+      dfc$target <- as.numeric(ytr)
+      
+      dm <- tryCatch(mRMRe::mRMR.data(data = dfc), error = function(e) NULL)
+      if (is.null(dm)) next
+      
+      res <- tryCatch(
+        mRMRe::mRMR.classic(data = dm, target_indices = ncol(dfc), 
+                            feature_count = min(top_features_per_chunk, length(feats))),
+        error = function(e) NULL
+      )
+      if (is.null(res)) next
+      
+      idx <- mRMRe::solutions(res)[[1]]
+      sel_from_chunks <- c(sel_from_chunks, mRMRe::featureNames(dm)[idx])
+    }
+    
+    if (length(sel_from_chunks) < 2) { 
+      warning(paste("Fold", i, ": not enough features, fallback to variance features")) 
+      sel_from_chunks <- selected 
+    }
+    
+    df_agg <- as.data.frame(Xtr[, sel_from_chunks, drop = FALSE])
+    df_agg$target <- as.numeric(ytr)
+    dm2 <- mRMRe::mRMR.data(data = df_agg)
+    final_k <- min(final_num_features, length(sel_from_chunks))
+    res2 <- mRMRe::mRMR.classic(data = dm2, target_indices = ncol(df_agg), feature_count = final_k)
+    fidx <- mRMRe::solutions(res2)[[1]]
+    final_feats <- mRMRe::featureNames(dm2)[fidx]
+    
+    results$features_per_fold[[i]] <- final_feats
+    
+    # Train & evaluate GLM model
+    tr_df <- as.data.frame(Xtr[, final_feats, drop = FALSE])
+    tr_df$Class <- ytr
+    mdl <- glm(Class ~ ., data = tr_df, family = binomial)
+    
+    te_df <- as.data.frame(Xte[, final_feats, drop = FALSE])
+    prob <- predict(mdl, newdata = te_df, type = "response")
+    pred <- factor(ifelse(prob > 0.5, levels(y_train)[2], levels(y_train)[1]),
+                   levels = levels(y_train))
+    
+    cm <- confusionMatrix(pred, yte, positive = levels(y_train)[2])
+    roc_obj <- roc(response = yte, predictor = prob, levels = rev(levels(yte)))
+    fold_metrics <- get_metrics(cm, roc_obj)
+    
+    results$metrics <- rbind(results$metrics, cbind(Fold = i, fold_metrics))
+  }
+  
+  results$mean_metrics <- colMeans(results$metrics[, -1, drop = FALSE], na.rm = TRUE)
+  results
+}
+
+```
+
+
+# 5) Runner Per Dataset
+
+```{r runner}
+run_filters_for_dataset <- function(dname, data_list, 
+                                    chi_top_n = 50, chi_bins = 3, 
+                                    mrmr_top_chunk = 10, mrmr_final = 50, 
+                                    seed = 1996) { 
+  cat("\n==================== Dataset:", dname, "====================\n") 
+  Xtr <- t(data_list$train_expr) 
+  ytr <- data_list$train_labels 
+  Xte <- t(data_list$test_expr) 
+  yte <- data_list$test_labels 
+  cat("Train n:", nrow(Xtr), " Test n:", nrow(Xte), "\n") 
+   
+  chi_res <- chi_square_cv(Xtr, ytr, top_n = chi_top_n, cv_folds = 5, bins = chi_bins, seed = seed) 
+  mrmr_res <- mrmr_cv(Xtr, ytr, top_features_per_chunk = mrmr_top_chunk, final_num_features = mrmr_final, cv_folds = 5, seed = seed) 
+   
+  chi_mean <- chi_res$mean_metrics 
+  mrmr_mean <- mrmr_res$mean_metrics 
+  comp <- rbind( 
+    data.frame(Method = "Chi-Square", as.list(chi_mean)), 
+    data.frame(Method = "mRMR", as.list(mrmr_mean)) 
+  ) |> tibble::as_tibble() 
+   
+  list( 
+    chi = chi_res, 
+    mrmr = mrmr_res, 
+    comparative = comp 
+  ) 
+} 
+```
+
+
+# 6) Run All Datasets
+
+```{r run_all}
+results_list <- lapply(names(split_data), function(nm)  
+  run_filters_for_dataset(nm, split_data[[nm]])) 
+names(results_list) <- names(split_data) 
+```
+
+
+````{r}
+create_summary_table <- function(results_list) {
+  summary_data <- data.frame()
+  
+  for (dataset_name in names(results_list)) {
+    dataset_results <- results_list[[dataset_name]]
+    
+    for (method_name in c("chi", "mrmr")) {
+      method_metrics <- dataset_results[[method_name]]$mean_metrics
+      
+      summary_data <- rbind(summary_data, data.frame(
+        Dataset = dataset_name,
+        Method = ifelse(method_name == "chi", "Chi-Square", "mRMR"),
+        Accuracy = as.numeric(method_metrics["Accuracy"]),
+        AUC = as.numeric(method_metrics["AUC"]),
+        Sensitivity = as.numeric(method_metrics["Sensitivity"]),
+        Specificity = as.numeric(method_metrics["Specificity"]),
+        Precision = as.numeric(method_metrics["Precision"]),
+        F1 = as.numeric(method_metrics["F1_Score"]),
+        MCC = as.numeric(method_metrics["MCC"]),
+        Balanced_Accuracy = as.numeric(method_metrics["Balanced_Accuracy"]),
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  return(summary_data)
+}
+
+# Global ranking by averaging across datasets
+create_global_ranking <- function(summary_data) {
+  global_ranking <- summary_data %>%
+    group_by(Method) %>%
+    summarise(
+      Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+      Mean_AUC = mean(AUC, na.rm = TRUE),
+      Mean_F1 = mean(F1, na.rm = TRUE),
+      Mean_Specificity = mean(Specificity, na.rm = TRUE),
+      Mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
+      SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+      SD_AUC = sd(AUC, na.rm = TRUE),
+      Datasets = n()
+    ) %>%
+    mutate(
+      Accuracy_Rank = rank(-Mean_Accuracy),
+      AUC_Rank = rank(-Mean_AUC),
+      F1_Rank = rank(-Mean_F1),
+      Specificity_Rank = rank(-Mean_Specificity),
+      Overall_Rank = (Accuracy_Rank + AUC_Rank + F1_Rank + Specificity_Rank) / 4
+    ) %>%
+    arrange(Overall_Rank)
+  
+  return(global_ranking)
+}
+
+# Generate tables
+summary_table <- create_summary_table(results_list)
+global_ranking <- create_global_ranking(summary_table)
+
+# Print comprehensive performance results
+cat("\n=== COMPREHENSIVE PERFORMANCE RESULTS ===\n")
+print(
+  kable(summary_table, digits = 3,
+        caption = "Performance Metrics: Chi-Square vs mRMR Feature Selection") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE) %>%
+    column_spec(1, bold = TRUE) %>%
+    row_spec(which(summary_table$Method == "Chi-Square"), 
+             background = "#E8F4F8", bold = TRUE) %>%
+    row_spec(which(summary_table$Method == "mRMR"), 
+             background = "#F8E8E8", bold = TRUE)
+)
+
+cat("\n\n=== GLOBAL PERFORMANCE RANKING ===\n")
+print(
+  kable(global_ranking, digits = 3,
+        caption = "Overall Performance Across All Datasets") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE) %>%
+    row_spec(1, bold = TRUE, color = "white", background = "#2E86AB")
+)
+# Key performance insights
+cat("\n\n=== KEY PERFORMANCE INSIGHTS ===\n")
+best_metrics <- data.frame(
+  Metric = c("Accuracy", "AUC", "F1-Score", "Specificity"),
+  Best_Method = c(
+    global_ranking$Method[which.max(global_ranking$Mean_Accuracy)],
+    global_ranking$Method[which.max(global_ranking$Mean_AUC)],
+    global_ranking$Method[which.max(global_ranking$Mean_F1)],
+    global_ranking$Method[which.max(global_ranking$Mean_Specificity)]
+  ),
+  Value = round(c(
+    max(global_ranking$Mean_Accuracy),
+    max(global_ranking$Mean_AUC),
+    max(global_ranking$Mean_F1),
+    max(global_ranking$Mean_Specificity)
+  ), 3)
+)
+
+print(
+  kable(best_metrics, digits = 3,
+        caption = "Best Performing Method for Each Key Metric") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE)
+)
+
+# Export results
+write.csv(summary_table, "filter_methods_detailed_results.csv", row.names = FALSE)
+write.csv(global_ranking, "filter_methods_global_ranking.csv", row.names = FALSE)
+write.csv(best_metrics, "filter_methods_best_metrics.csv", row.names = FALSE)
+
+cat("\n\n=== RESULTS EXPORTED ===\n")
+cat(" Detailed results saved to:\n")
+cat("   - filter_methods_detailed_results.csv\n")
+cat("   - filter_methods_global_ranking.csv\n")
+cat("   - filter_methods_best_metrics.csv\n")
+
+# Final summary
+cat("\n=== FINAL SUMMARY ===\n")
+winner <- global_ranking$Method[1]
+cat(" Overall Best Method:", winner, "\n")
+cat(" Mean Accuracy:", round(global_ranking$Mean_Accuracy[1], 3), "\n")
+cat(" Mean AUC:", round(global_ranking$Mean_AUC[1], 3), "\n")
+cat(" Mean F1-Score:", round(global_ranking$Mean_F1[1], 3), "\n")
+cat("️ Mean Specificity:", round(global_ranking$Mean_Specificity[1], 3), "\n")
+
+````
+
+
+## 🔹 Step 1: Collect Features Per Dataset/Method
+
+```{r}
+# Extract final features (union across folds for each dataset & method)
+feature_sets <- list()
+for (dataset_name in names(results_list)) {
+  chi_feats   <- unique(unlist(results_list[[dataset_name]]$chi$features_per_fold))
+  mrmr_feats  <- unique(unlist(results_list[[dataset_name]]$mrmr$features_per_fold))
+  feature_sets[[dataset_name]] <- list(ChiSquare = chi_feats, mRMR = mrmr_feats)
+}
+```
+## 🔹 Step 2: Faceted Venn Diagrams (ggplot-based)
+```{r}
+library(ggVennDiagram) 
+library(patchwork)
+
+venn_plots <- lapply(names(feature_sets), function(dataset) {
+  ggVennDiagram(feature_sets[[dataset]], label = "count") +
+    scale_fill_gradient(low = "#E8F4F8", high = "#F8E8E8") +
+    ggtitle(dataset)
+})
+
+venn_faceted <- wrap_plots(venn_plots, ncol = 2)  # 2x2 grid
+venn_faceted
+ggsave("venn_faceted.pdf", venn_faceted, width = 12, height = 8)
+```
+##  Step 3: UpSet Plots
+
+```{r}
+library(UpSetR)
+
+pdf("upset_faceted.pdf", width = 12, height = 8) 
+for (dataset in names(feature_sets)) {
+  sets <- feature_sets[[dataset]]
+  upset(fromList(sets), 
+        nsets = 2, 
+        sets.bar.color = c("#2E86AB", "#D94E4E"),
+        mainbar.y.label = paste("Intersection Size -", dataset),
+        sets.x.label = "Feature Counts")
+}
+library(UpSetR)
+
+# Loop over datasets and plot directly
+for (dataset in names(feature_sets)) {
+  cat("\n=== UpSet Plot for", dataset, "===\n")
+  sets <- feature_sets[[dataset]]
+  print(
+    upset(fromList(sets),
+          nsets = 2,
+          sets.bar.color = c("#2E86AB", "#D94E4E"),
+          mainbar.y.label = paste("Intersection Size -", dataset),
+          sets.x.label = "Feature Counts")
+  )
+}
+
+dev.off()
+```
+
+```{r}
+library(UpSetR)
+
+dataset <- "Lung"   # change to Breast, Liver, Gastric
+sets <- feature_sets[[dataset]]
+
+upset(fromList(sets),
+      nsets = 2,
+      sets.bar.color = c("#2E86AB", "#D94E4E"),
+      mainbar.y.label = paste("Intersection Size -", dataset),
+      sets.x.label = "Feature Counts")
+```
+```{r}
+library(ggplot2)
+
+# Example: density of Accuracy for both methods
+ggplot(summary_table, aes(x = Accuracy, fill = Method)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density of Accuracy by Method",
+       x = "Accuracy",
+       y = "Density") +
+  theme_minimal()
+summary_long <- summary_table %>%
+  pivot_longer(cols = c(Accuracy, AUC, Sensitivity, Specificity, Precision, F1),
+               names_to = "Metric", values_to = "Value")
+
+ggplot(summary_long, aes(x = Value, fill = Method)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Metric, scales = "free") +
+  labs(title = "Density of Metrics by Method",
+       x = "Metric Value",
+       y = "Density") +
+  theme_minimal()
+ggplot(summary_long, aes(x = Value, fill = Method)) +
+  geom_density(alpha = 0.5) +
+  facet_grid(Metric ~ Dataset, scales = "free") +
+  labs(title = "Density of Metrics by Method & Dataset",
+       x = "Metric Value",
+       y = "Density") +
+  theme_minimal()
+
+
+```
+
+````{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Reshape summary_table to long format
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols = c(Accuracy, F1, AUC, Specificity),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Density plot faceted by Dataset
+ggplot(summary_long, aes(x = Value, fill = Metric)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Dataset, scales = "free") +
+  labs(
+    title = "Distribution of Key Metrics by Dataset",
+    x = "Metric Value",
+    y = "Density",
+    fill = "Metric"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+````
+
+````{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Combine per-fold metrics across datasets
+summary_folds <- lapply(names(results_list), function(ds) {
+  chi <- results_list[[ds]]$chi$metrics %>% mutate(Method="Chi-Square", Dataset=ds)
+  mrmr <- results_list[[ds]]$mrmr$metrics %>% mutate(Method="mRMR", Dataset=ds)
+  bind_rows(chi, mrmr)
+}) %>% bind_rows()
+
+# Pivot to long for key metrics
+metrics_to_plot <- c("Accuracy", "F1_Score", "AUC", "Specificity")
+summary_long <- summary_folds %>%
+  pivot_longer(cols = all_of(metrics_to_plot),
+               names_to = "Metric",
+               values_to = "Value")
+
+# Density plot faceted by Dataset and Metric
+density_plot <- ggplot(summary_long, aes(x=Value, fill=Method)) +
+  geom_density(alpha=0.5, adjust=1.2) +
+  facet_grid(Metric ~ Dataset, scales="free") +
+  labs(title="Density of Metrics per Method & Dataset (per-fold)",
+       x="Metric Value", y="Density") +
+  scale_fill_brewer(palette="Set1") +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face="bold"),
+    plot.title = element_text(hjust=0.5, face="bold"),
+    legend.position = "top"
+  )
+
+# Print plot in R
+print(density_plot)
+
+# Save as PDF
+ggsave("density_metrics_per_fold.pdf", density_plot, width=12, height=8)
+
+````
+
+````{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Convert summary_table to long format for plotting
+summary_long <- summary_table %>%
+  pivot_longer(cols = c(Accuracy, F1, AUC, Specificity, Precision, MCC, Balanced_Accuracy),
+               names_to = "Metric", values_to = "Value")
+
+# Bar plot: Mean metrics per Method, faceted by Dataset
+bar_plot <- ggplot(summary_long, aes(x = Method, y = Value, fill = Method)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Dataset + Metric, scales = "free_y") +
+  labs(title = "Mean Performance Metrics per Method by Dataset",
+       x = "Method", y = "Metric Value") +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face="bold"),
+        legend.position = "none")
+
+bar_plot
+ggsave("bar_metrics_faceted.pdf", bar_plot, width = 14, height = 10)
+````
+
+
+````{r}
+
+# Example: Accuracy vs F1 per fold
+scatter_plot <- ggplot(summary_folds, aes(x = Accuracy, y = F1_Score, color = Method)) +
+  geom_point(size = 2, alpha = 0.7) +
+  facet_wrap(~ Dataset, scales = "free") +
+  labs(title = "Accuracy vs F1-Score per Dataset & Method",
+       x = "Accuracy", y = "F1-Score") +
+  scale_color_brewer(palette="Set1") +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face="bold"),
+        legend.position = "top")
+
+scatter_plot
+ggsave("scatter_accuracy_f1_faceted.pdf", scatter_plot, width = 12, height = 8)
+
+````
+
+
+
+
+
+
