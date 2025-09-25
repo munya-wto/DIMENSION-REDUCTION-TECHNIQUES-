@@ -1,0 +1,386 @@
+
+---
+title: "Exploratory Data Analysis"
+author: "2555479 Munyaradzi Ndumeya"
+date: "2025-08-27"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, results = 'hold')
+set.seed(1996)
+```
+
+# 0) Packages
+
+```{r libraries}
+library(GEOquery)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tibble)
+library(gridExtra)
+library(pheatmap)
+library(RColorBrewer)
+library(stats)
+```
+
+# 1) Loading and Labelling Datasets
+
+```{r load_datasets}
+load_GEO_dataset <- function(gse_id) {
+  cat("\n--- Loading dataset:", gse_id, "---\n")
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)   
+  pheno <- pData(gse)  
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  # Label extraction
+  tissue_col <- grep("tissue|characteristics|source|description", 
+                     colnames(pheno), ignore.case = TRUE, value = TRUE)[1]
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case = TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case = TRUE), "Normal", NA))
+  labels <- factor(labels, levels = c("Normal", "Tumor"))
+  
+  list(expr = expr, pheno = pheno, labels = labels)
+}
+
+datasets <- list(
+  Lung   = "GSE19804",
+  Breast = "GSE15852",
+  Liver  = "GSE112790",
+  Gastric= "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+ 
+#******************          2.Data Quality Checks         *********************
+
+#  2.a Dimensions & Class Distribution
+
+```{r qc_dimensions}
+for (nm in names(loaded_data)) {
+  cat("\n### Dataset:", nm, "###\n")
+  X <- loaded_data[[nm]]$expr
+  y <- loaded_data[[nm]]$labels
+  cat("Number of samples:", ncol(X), "\n")
+  cat("Number of features:", nrow(X), "\n")
+  cat("Class distribution:\n")
+  print(table(y))
+}
+```
+
+
+#  2.b Missingness
+
+```{r qc_missing}
+for (nm in names(loaded_data)) {
+  X <- loaded_data[[nm]]$expr
+  cat("\n### Dataset:", nm, "###\n")
+  cat("Total missing values:", sum(is.na(X)), "\n")
+  
+  missing_per_gene <- rowMeans(is.na(X))
+  cat("Genes with >10% missing:", sum(missing_per_gene > 0.1), "\n")
+  
+  missing_per_sample <- colMeans(is.na(X))
+  cat("Samples with >10% missing:", sum(missing_per_sample > 0.1), "\n")
+}
+```
+
+
+# 2.c Feature Variance
+
+```{r qc_variance}
+for (nm in names(loaded_data)) {
+  X <- t(loaded_data[[nm]]$expr)
+  vars <- apply(X, 2, var)
+  cat("\n### Dataset:", nm, "###\n")
+  cat("Min variance:", min(vars), "\n")
+  cat("Max variance:", max(vars), "\n")
+  cat("Median variance:", median(vars), "\n")
+}
+```
+
+
+## 2.d Duplicate Samples
+
+```{r qc_duplicates}
+for (nm in names(loaded_data)) {
+  X <- t(loaded_data[[nm]]$expr)
+  duplicates <- sum(duplicated(X))
+  cat("\n### Dataset:", nm, "###\n")
+  cat("Number of duplicate samples:", duplicates, "\n")
+}
+```
+
+
+## 2.e Outlier Detection and Class separation(PCA)
+
+```{r qc_outliers_pca}
+for (nm in names(loaded_data)) {
+  X <- t(loaded_data[[nm]]$expr)
+  pca <- prcomp(X, scale. = TRUE)
+  scores <- pca$x[,1:2]
+  y <- loaded_data[[nm]]$labels
+  df <- data.frame(PC1 = scores[,1], PC2 = scores[,2], Class = y)
+  
+  p <- ggplot(df, aes(x = PC1, y = PC2, color = Class)) +
+       geom_point(size = 3) +
+       ggtitle(paste("PCA —", nm, "(Outlier Detection)")) +
+       theme_minimal()
+  print(p)
+}
+```
+
+
+## 2.f Hierarchical Clustering (optional outlier check)
+
+```{r qc_hclust}
+for (nm in names(loaded_data)) {
+  X <- t(loaded_data[[nm]]$expr)
+  dist_mat <- dist(X)
+  hc <- hclust(dist_mat)
+  plot(hc, main = paste("Hierarchical Clustering —", nm))
+}
+```
+
+
+## 2.g Check Class Balance
+
+```{r qc_class_balance}
+for (nm in names(loaded_data)) {
+  y <- loaded_data[[nm]]$labels
+  df <- data.frame(Class = y)
+  p <- ggplot(df, aes(x = Class)) +
+       geom_bar(fill = "darkorange") +
+       ggtitle(paste("Raw Class Distribution —", nm)) +
+       theme_minimal()
+  print(p)
+}
+```
+
+
+## 2.e Data Consistency Checks
+
+```{r qc_consistency}
+for (nm in names(loaded_data)) {
+  X <- loaded_data[[nm]]$expr
+  y <- loaded_data[[nm]]$labels
+  stopifnot(length(y) == ncol(X)) # Samples match labels
+  stopifnot(all(!is.na(y)))       # No missing labels
+}
+cat("\nAll datasets passed consistency checks.\n")
+```
+
+
+## 2.f Optional Microarray QC Checks
+
+#* Checking for extreme outliers in expression values.
+#* Visualising distributions across samples using boxplots or density plots.
+
+```{r qc_boxplots}
+library(reshape2)
+
+for (nm in names(loaded_data)) {
+  X <- loaded_data[[nm]]$expr
+  df <- as.data.frame(X)
+  df_melt <- melt(df, variable.name = "Sample", value.name = "Expression")
+  
+  p <- ggplot(df_melt, aes(x = Sample, y = Expression)) +
+       geom_boxplot(outlier.size = 0.5) +
+       ggtitle(paste("Expression Distribution —", nm)) +
+       xlab("Samples") + ylab("Expression") +
+       theme(axis.text.x = element_blank())
+  
+  print(p)
+}
+```
+
+
+```{r Cluster}
+for (nm in names(loaded_data)) {
+  expr <- loaded_data[[nm]]$expr
+  
+  # Compute variance for each gene
+  gene_vars <- apply(expr, 1, var)
+  
+  # Select top 20 most variable genes
+  top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:10]
+  X <- t(expr[top_genes, ])  # transpose: samples as rows
+  
+  # Compute distance and cluster
+  dist_mat <- dist(X)
+  hc <- hclust(dist_mat)
+  
+  # Plot dendrogram
+  plot(hc, main = paste("Hierarchical Clustering — Top 20 Most Variable Genes —", nm),
+       xlab = "", sub = "", cex = 0.8)
+}
+```
+
+#ADDITIONAL PLOTS
+
+````{r}
+# Load additional packages for clustering and separation analysis
+library(cluster)
+library(factoextra)
+library(pROC)
+
+########################################
+# 3. Separation Analysis: Tumor vs Normal
+########################################
+
+# 3.a Enhanced PCA with Variance Explained and Ellipses
+for (nm in names(loaded_data)) {
+    X <- t(loaded_data[[nm]]$expr)
+    y <- loaded_data[[nm]]$labels
+    
+    # Perform PCA
+    pca <- prcomp(X, scale. = TRUE)
+    variance_explained <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 2)
+    
+    # Create PCA plot with ellipses
+    p <- fviz_pca_ind(pca, 
+                     geom.ind = "point",
+                     col.ind = y,
+                     palette = c("blue", "red"),
+                     addEllipses = TRUE,
+                     ellipse.level = 0.68,
+                     legend.title = "Class",
+                     title = paste("PCA -", nm, "\n(PC1:", variance_explained[1], "%, PC2:", variance_explained[2], "%)")) +
+        theme_minimal()
+    print(p)
+    
+    # Calculate separation score (distance between class centroids)
+    scores <- pca$x[, 1:2]
+    centroid_normal <- colMeans(scores[y == "Normal", ])
+    centroid_tumor <- colMeans(scores[y == "Tumor", ])
+    separation_distance <- dist(rbind(centroid_normal, centroid_tumor))[1]
+    
+    cat("\n### Dataset:", nm, "###\n")
+    cat("Separation distance between centroids:", round(separation_distance, 2), "\n")
+    cat("Variance explained by PC1:", variance_explained[1], "%\n")
+    cat("Variance explained by PC2:", variance_explained[2], "%\n")
+}
+
+# 3.b k-means Clustering (k=2) to check alignment with true labels
+for (nm in names(loaded_data)) {
+    X <- t(loaded_data[[nm]]$expr)
+    y <- loaded_data[[nm]]$labels
+    
+    # Perform k-means clustering
+    set.seed(123)
+    kmeans_result <- kmeans(X, centers = 2, nstart = 25)
+    
+    # Create confusion matrix
+    conf_matrix <- table(True = y, Predicted = kmeans_result$cluster)
+    
+    # Calculate clustering accuracy (align clusters with true labels)
+    accuracy <- max(
+        sum(diag(conf_matrix[c(1,2), c(1,2)])),  # Normal=1, Tumor=2
+        sum(diag(conf_matrix[c(1,2), c(2,1)]))   # Normal=2, Tumor=1
+    ) / sum(conf_matrix)
+    
+    # Plot k-means results
+    p <- fviz_cluster(kmeans_result, data = X,
+                     palette = c("blue", "red"),
+                     geom = "point",
+                     ggtheme = theme_minimal(),
+                     main = paste("K-means Clustering (k=2) -", nm, "\nAccuracy:", round(accuracy, 3)))
+    print(p)
+    
+    cat("\n### Dataset:", nm, "###\n")
+    print("Confusion Matrix (K-means vs True Labels):")
+    print(conf_matrix)
+    cat("Clustering accuracy:", round(accuracy, 3), "\n")
+}
+
+````
+
+````{r}
+# Create a list to store PCA plots
+pca_plots <- list()
+
+# Generate PCA plots for each dataset
+for (nm in names(loaded_data)) {
+    X <- t(loaded_data[[nm]]$expr)
+    y <- loaded_data[[nm]]$labels
+    
+    # Perform PCA
+    pca <- prcomp(X, scale. = TRUE)
+    scores <- pca$x[, 1:2]
+    df_pca <- data.frame(PC1 = scores[, 1], PC2 = scores[, 2], Class = y)
+    
+    # Create simplified PCA plot with different shapes
+    p <- ggplot(df_pca, aes(x = PC1, y = PC2, color = Class, shape = Class)) +
+        geom_point(size = 2, alpha = 0.7) +
+        stat_ellipse(level = 0.68, linetype = 2, size = 0.5) +
+        scale_color_manual(values = c("Normal" = "blue", "Tumor" = "red")) +
+        scale_shape_manual(values = c("Normal" = 16, "Tumor" = 17)) + # 16=circle, 17=triangle
+        ggtitle(paste("PCA -", nm)) +
+        theme_minimal() +
+        theme(legend.position = "right",
+              plot.title = element_text(hjust = 0.5, face = "bold"),
+              axis.title = element_text(size = 10),
+              axis.text = element_text(size = 8))
+    
+    pca_plots[[nm]] <- p
+}
+
+# Arrange plots in 2x2 grid
+library(gridExtra)
+final_plot <- grid.arrange(
+    pca_plots$Lung + labs(x = "", y = "") + theme(legend.position = "none"),
+    pca_plots$Breast + labs(x = "", y = "") + theme(legend.position = "none"),
+    pca_plots$Liver + labs(x = "", y = "") + theme(legend.position = "none"),
+    pca_plots$Gastric + labs(x = "", y = "") + theme(legend.position = "none"),
+    nrow = 2,
+    ncol = 2,
+    bottom = "PC1",
+    left = "PC2"
+)
+
+# Add common legend
+library(gtable)
+library(grid)
+
+# Extract legend from first plot
+legend <- gtable_filter(ggplotGrob(pca_plots$Lung), "guide-box")
+
+# Create final plot with legend
+final_plot_with_legend <- grid.arrange(
+    arrangeGrob(
+        final_plot,
+        legend,
+        ncol = 2,
+        widths = c(4, 1)
+    )
+)
+
+# Save to PDF
+pdf("PCA_Faceted_Plots_Shapes.pdf", width = 10, height = 8)
+print(final_plot_with_legend)
+dev.off()
+
+cat("PDF saved as 'PCA_Faceted_Plots_Shapes.pdf'\n")
+
+# Alternative simpler approach without complex legend handling
+pdf("PCA_Faceted_Plots_Simple_Shapes.pdf", width = 10, height = 8)
+grid.arrange(
+    pca_plots$Lung + theme(legend.position = "none"),
+    pca_plots$Breast + theme(legend.position = "none"), 
+    pca_plots$Liver + theme(legend.position = "none"),
+    pca_plots$Gastric + theme(legend.position = "none"),
+    nrow = 2,
+    ncol = 2
+)
+dev.off()
+
+cat("Simple version saved as 'PCA_Faceted_Plots_Simple_Shapes.pdf'\n")
+````
+
