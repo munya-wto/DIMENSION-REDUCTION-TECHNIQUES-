@@ -1,0 +1,537 @@
+
+---
+title: "Embedded Methods  REGULARISATION COMPARISON  LASSO vs RIDGE"
+author: "2555479 Munyaradzi Ndumeya"
+date: "2025-08-20"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+# OPTIONAL ::: To clear the entire history
+````{r}
+rm(list = ls(all.names = TRUE), .history)
+````
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, results = 'hold')
+set.seed(1996)
+```
+
+# 0) Packages::
+
+```{r libraries}
+library(GEOquery)
+library(caret)
+library(glmnet)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tibble)
+library(smotefamily)
+library(gridExtra)
+library(sva)
+library(patchwork)
+library(kableExtra)
+library(tidyr)
+set.seed(1996)
+```
+
+# 1) Load & Label GEO Datasets
+
+```{r load_data}
+options(timeout = 60000)
+load_GEO_dataset <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)
+  pheno <- pData(gse)
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  tissue_col <- grep("tissue|characteristics|source|description", colnames(pheno),
+                     ignore.case = TRUE, value = TRUE)[1]
+  
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case = TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case = TRUE), "Normal", NA))
+  labels <- factor(labels, levels = c("Normal", "Tumor"))
+  
+  list(expr = expr, pheno = pheno, labels = labels)
+}
+
+datasets <- list(
+  Lung    = "GSE19804",
+  Breast  = "GSE15852",
+  Liver   = "GSE112790",
+  Gastric = "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+# 2) Preprocessing Pipeline
+
+```{r preprocessing}
+ set.seed(1996) # Global seed
+
+split_data <- list()
+
+for(nm in names(loaded_data)) {
+  cat("\n=== Processing dataset:", nm, "===\n")
+  
+  # Extract features and labels
+  X <- loaded_data[[nm]]$expr
+  y <- loaded_data[[nm]]$labels
+  
+  # --- Train/test split
+  set.seed(1996)
+  train_idx <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[, train_idx, drop = FALSE]
+  X_test <- X[, -train_idx, drop = FALSE]
+  y_train <- y[train_idx]
+  y_test <- y[-train_idx]
+  
+  # --- Variance filtering
+  vars <- apply(X_train, 1, var)
+  keep_genes <- vars > quantile(vars, 0.2)
+  X_train <- X_train[keep_genes, , drop = FALSE]
+  X_test <- X_test[keep_genes, , drop = FALSE]
+  
+  # --- Balancing (SMOTE / upSample)
+  df_train <- data.frame(t(X_train), Class = y_train)
+  
+  if(nm == "Liver") {
+    set.seed(1996)
+    smote_result <- SMOTE(
+      X = df_train[, -ncol(df_train)],
+      target = df_train$Class,
+      K = 5, dup_size = 1
+    )
+    df_bal <- smote_result$data
+    colnames(df_bal)[ncol(df_bal)] <- "Class"
+    
+  } else if(nm == "Gastric") {
+    set.seed(1996)
+    df_bal <- upSample(
+      x = df_train[, -ncol(df_train)],
+      y = df_train$Class,
+      yname = "Class"
+    )
+    
+  } else {
+    df_bal <- df_train
+  }
+  
+  X_train <- t(as.matrix(df_bal[, -ncol(df_bal)]))
+  y_train <- df_bal$Class
+  
+  # --- Batch correction
+  pheno_train <- loaded_data[[nm]]$pheno[colnames(X_train), , drop = FALSE]
+  pheno_test  <- loaded_data[[nm]]$pheno[colnames(X_test), , drop = FALSE]
+  
+  if(!is.null(pheno_train$batch) && length(unique(pheno_train$batch)) > 1) {
+    mod_train <- model.matrix(~1, pheno_train)
+    X_train <- ComBat(
+      dat = X_train,
+      batch = pheno_train$batch,
+      mod = mod_train,
+      par.prior = TRUE,
+      prior.plots = FALSE
+    )
+    
+    if(!is.null(pheno_test$batch)) {
+      X_test <- ComBat(
+        dat = X_test,
+        batch = pheno_test$batch,
+        mod = mod_train,
+        par.prior = TRUE,
+        prior.plots = FALSE,
+        ref.batch = pheno_train$batch[1]
+      )
+    }
+  }
+  
+  # --- Store processed data
+  split_data[[nm]] <- list(
+    train_expr = X_train,
+    test_expr  = X_test,
+    train_labels = y_train,
+    test_labels  = y_test
+  )
+}
+
+```
+
+# 3) Regularization Methods Comparison: LASSO ($\alpha=1$=1) vs RIDGE ($\alpha=1$=0)
+
+```{r regularization_methods_comparison}
+set.seed(1996)
+# Function to calculate all metrics
+calculate_metrics <- function(pred_prob, true_labels) {
+  # Ensure both are factors with same levels
+  true_labels <- factor(true_labels, levels = c("Normal", "Tumor"))
+  pred_class <- factor(ifelse(pred_prob > 0.5, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+  
+  cm <- confusionMatrix(pred_class, true_labels, positive = "Tumor")
+  
+  TP <- cm$table["Tumor", "Tumor"]
+  TN <- cm$table["Normal", "Normal"]
+  FP <- cm$table["Tumor", "Normal"]
+  FN <- cm$table["Normal", "Tumor"]
+  
+  den <- sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+  MCC <- ifelse(den > 0, (TP*TN - FP*FN)/den, NA)
+  
+  roc_obj <- roc(response = true_labels, predictor = pred_prob, levels = rev(levels(true_labels)))
+  
+  data.frame(
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    AUC = as.numeric(auc(roc_obj)),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    Precision = as.numeric(cm$byClass["Pos Pred Value"]),
+    F1 = as.numeric(cm$byClass["F1"]),
+    MCC = MCC,
+    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"])
+  )
+}
+
+# Main comparison function - OPTIMIZED
+set.seed(1996)  # Global seed
+
+compare_regularization_methods <- function(split_data, cv_folds = 3) {
+  results <- list()
+  
+  for (nm in names(split_data)) {
+    cat("\n=== Dataset:", nm, "===\n")
+    
+    X_train <- t(split_data[[nm]]$train_expr)
+    y_train <- factor(split_data[[nm]]$train_labels, levels = c("Normal", "Tumor"))
+    X_test  <- t(split_data[[nm]]$test_expr)
+    y_test  <- split_data[[nm]]$test_labels
+    y_bin <- ifelse(y_train == "Tumor", 1, 0)
+    
+    # --- Parallel backend
+    library(doParallel)
+    registerDoParallel(cores = 2)
+    
+    set.seed(1996)  # Seed before CV folds
+    folds <- createFolds(y_train, k = cv_folds, list = TRUE, returnTrain = TRUE)
+    
+    fold_results <- list(LASSO = list(), RIDGE = list())
+    
+    for (i in seq_along(folds)) {
+      cat("Processing fold", i, "of", length(folds), "\n")
+      
+      train_idx <- folds[[i]]
+      test_idx <- setdiff(seq_along(y_train), train_idx)
+      
+      # --- LASSO
+      set.seed(1996)
+      cv_lasso <- cv.glmnet(X_train[train_idx, ], y_bin[train_idx], 
+                            alpha = 1, family = "binomial", nfolds = 3, parallel = TRUE)
+      pred_lasso <- predict(cv_lasso, X_train[test_idx, ], s = "lambda.min", type = "response")
+      metrics_lasso <- calculate_metrics(pred_lasso, y_train[test_idx])
+      
+      # --- RIDGE
+      set.seed(1996)
+      cv_ridge <- cv.glmnet(X_train[train_idx, ], y_bin[train_idx], 
+                            alpha = 0, family = "binomial", nfolds = 3, parallel = TRUE)
+      pred_ridge <- predict(cv_ridge, X_train[test_idx, ], s = "lambda.min", type = "response")
+      metrics_ridge <- calculate_metrics(pred_ridge, y_train[test_idx])
+      
+      fold_results$LASSO[[i]] <- metrics_lasso
+      fold_results$RIDGE[[i]] <- metrics_ridge
+    }
+    
+    stopImplicitCluster()
+    
+    avg_lasso <- bind_rows(fold_results$LASSO) %>% colMeans()
+    avg_ridge <- bind_rows(fold_results$RIDGE) %>% colMeans()
+    
+    results[[nm]] <- list(LASSO = avg_lasso, RIDGE = avg_ridge)
+    
+    cat("LASSO metrics:\n"); print(round(avg_lasso, 3))
+    cat("RIDGE metrics:\n"); print(round(avg_ridge, 3))
+  }
+  
+  return(results)
+}
+
+# Run comparison
+regularization_results <- compare_regularization_methods(split_data)
+```
+# 4) Results Extraction and Summary Tables
+
+```{r results_summary}
+# Create comprehensive results table
+create_summary_table <- function(results) {
+  summary_data <- data.frame()
+  
+  for (dataset_name in names(results)) {
+    dataset_results <- results[[dataset_name]]
+    
+    for (method_name in names(dataset_results)) {
+      method_metrics <- dataset_results[[method_name]]
+      
+      # Extract numeric values from the metrics
+      summary_data <- rbind(summary_data, data.frame(
+        Dataset = dataset_name,
+        Method = method_name,
+        Accuracy = as.numeric(method_metrics["Accuracy"]),
+        AUC = as.numeric(method_metrics["AUC"]),
+        Sensitivity = as.numeric(method_metrics["Sensitivity"]),
+        Specificity = as.numeric(method_metrics["Specificity"]),
+        Precision = as.numeric(method_metrics["Precision"]),
+        F1 = as.numeric(method_metrics["F1"]),
+        MCC = as.numeric(method_metrics["MCC"]),
+        Balanced_Accuracy = as.numeric(method_metrics["Balanced_Accuracy"]),
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  return(summary_data)
+}
+
+# Create global ranking with proper handling
+create_global_ranking <- function(summary_data) {
+  global_ranking <- summary_data %>%
+    group_by(Method) %>%
+    summarise(
+      Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+      Mean_AUC = mean(AUC, na.rm = TRUE),
+      Mean_F1 = mean(F1, na.rm = TRUE),
+      Mean_Specificity = mean(Specificity, na.rm = TRUE),
+      Mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
+      SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+      SD_AUC = sd(AUC, na.rm = TRUE),
+      Datasets = n()
+    ) %>%
+    mutate(
+      Accuracy_Rank = rank(-Mean_Accuracy),
+      AUC_Rank = rank(-Mean_AUC),
+      F1_Rank = rank(-Mean_F1),
+      Specificity_Rank = rank(-Mean_Specificity),
+      Overall_Rank = (Accuracy_Rank + AUC_Rank + F1_Rank + Specificity_Rank) / 4
+    ) %>%
+    arrange(Overall_Rank)
+  
+  return(global_ranking)
+}
+
+# Generate tables
+summary_table <- create_summary_table(regularization_results)
+global_ranking <- create_global_ranking(summary_table)
+
+# Print formatted tables
+cat("\n=== COMPREHENSIVE PERFORMANCE RESULTS ===\n")
+print(
+  kable(summary_table, digits = 3, 
+        caption = "Performance Metrics: LASSO vs RIDGE Regression") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE) %>%
+    column_spec(1, bold = TRUE) %>%
+    row_spec(which(summary_table$Method == "LASSO"), 
+             background = "#E8F4F8", bold = TRUE) %>%
+    row_spec(which(summary_table$Method == "RIDGE"), 
+             background = "#F8E8E8", bold = TRUE)
+)
+
+cat("\n\n=== GLOBAL PERFORMANCE RANKING ===\n")
+print(
+  kable(global_ranking, digits = 3, 
+        caption = "Overall Performance Across All Datasets") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE) %>%
+    row_spec(1, bold = TRUE, color = "white", background = "#2E86AB")
+)
+
+# Additional performance analysis
+cat("\n\n=== KEY PERFORMANCE INSIGHTS ===\n")
+
+# Best method for each key metric
+best_metrics <- data.frame(
+  Metric = c("Accuracy", "AUC", "F1-Score", "Specificity"),
+  Best_Method = c(
+    global_ranking$Method[which.max(global_ranking$Mean_Accuracy)],
+    global_ranking$Method[which.max(global_ranking$Mean_AUC)],
+    global_ranking$Method[which.max(global_ranking$Mean_F1)],
+    global_ranking$Method[which.max(global_ranking$Mean_Specificity)]
+  ),
+  Value = round(c(
+    max(global_ranking$Mean_Accuracy),
+    max(global_ranking$Mean_AUC),
+    max(global_ranking$Mean_F1),
+    max(global_ranking$Mean_Specificity)
+  ), 3)
+)
+
+print(
+  kable(best_metrics, digits = 3, 
+        caption = "Best Performing Method for Each Key Metric") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE)
+)
+
+# Performance differences between methods
+performance_comparison <- summary_table %>%
+  group_by(Dataset) %>%
+  summarise(
+    Accuracy_Diff = Accuracy[Method == "LASSO"] - Accuracy[Method == "RIDGE"],
+    AUC_Diff = AUC[Method == "LASSO"] - AUC[Method == "RIDGE"],
+    F1_Diff = F1[Method == "LASSO"] - F1[Method == "RIDGE"],
+    Specificity_Diff = Specificity[Method == "LASSO"] - Specificity[Method == "RIDGE"]
+  )
+
+cat("\n=== PERFORMANCE DIFFERENCES (LASSO - RIDGE) ===\n")
+print(
+  kable(performance_comparison, digits = 3,
+        caption = "Performance Differences Between Methods by Dataset") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE) %>%
+    column_spec(2:5, color = ifelse(performance_comparison[,2:5] > 0, "green", "red"))
+)
+
+# Export results
+write.csv(summary_table, "lasso_vs_ridge_detailed_results.csv", row.names = FALSE)
+write.csv(global_ranking, "global_performance_ranking.csv", row.names = FALSE)
+write.csv(best_metrics, "best_methods_summary.csv", row.names = FALSE)
+
+cat("\n\n=== RESULTS EXPORTED ===\n")
+cat(" Detailed results saved to:\n")
+cat("   - lasso_vs_ridge_detailed_results.csv\n")
+cat("   - global_performance_ranking.csv\n")
+cat("   - best_methods_summary.csv\n")
+
+# Final summary
+cat("\n=== FINAL SUMMARY ===\n")
+winner <- global_ranking$Method[1]
+cat(" Overall Best Method:", winner, "\n")
+cat(" Mean Accuracy:", round(global_ranking$Mean_Accuracy[1], 3), "\n")
+cat(" Mean AUC:", round(global_ranking$Mean_AUC[1], 3), "\n")
+cat(" Mean F1-Score:", round(global_ranking$Mean_F1[1], 3), "\n")
+cat(" Mean Specificity:", round(global_ranking$Mean_Specificity[1], 3), "\n")
+```
+
+# 5) Comprehensive Visualizations
+
+```{r visualizations}
+# 5.1 Performance Comparison Heatmap (Focus on Key Metrics)
+create_performance_heatmap <- function(summary_table) {
+  heatmap_data <- summary_table %>%
+    select(Dataset, Method, Accuracy, AUC, F1, Specificity) %>%
+    pivot_longer(cols = c(Accuracy, AUC, F1, Specificity), names_to = "Metric", values_to = "Value")
+  
+  ggplot(heatmap_data, aes(x = Method, y = paste(Dataset, Metric), fill = Value)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Value, 3)), color = "white", size = 3, fontface = "bold") +
+    scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "RdYlBu")) +
+    labs(title = "Performance Comparison: LASSO vs Ridge Regression",
+         subtitle = "Key metrics across all datasets",
+         x = "Method", y = "Dataset & Metric") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# 5.2 Key Metrics Radar Chart
+create_radar_chart <- function(summary_table) {
+  radar_data <- summary_table %>%
+    group_by(Method) %>%
+    summarise(across(c(Accuracy, AUC, F1, Specificity), mean)) %>%
+    mutate(across(-Method, ~scale(.)[,1])) %>%
+    pivot_longer(cols = -Method, names_to = "Metric", values_to = "Value")
+  
+  ggplot(radar_data, aes(x = Metric, y = Value, color = Method, group = Method)) +
+    geom_point(size = 3) +
+    geom_line(size = 1.2) +
+    geom_polygon(aes(fill = Method), alpha = 0.1) +
+    coord_polar() +
+    labs(title = "Radar Chart: LASSO vs Ridge Performance",
+         subtitle = "Standardized key metrics across all datasets") +
+    theme_minimal()
+}
+
+# 5.3 Method Ranking Visualization (Key Metrics)
+create_ranking_plot <- function(global_ranking) {
+  ranking_long <- global_ranking %>%
+    select(Method, Mean_Accuracy, Mean_AUC, Mean_F1, Mean_Specificity) %>%
+    pivot_longer(cols = -Method, names_to = "Metric", values_to = "Value")
+  
+  ggplot(ranking_long, aes(x = Metric, y = Value, fill = Method)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = round(Value, 3)), 
+              position = position_dodge(width = 0.9), vjust = -0.5) +
+    labs(title = "Global Performance Ranking",
+         subtitle = "Average key metrics across all datasets",
+         y = "Score", x = "Metric") +
+    theme_minimal()
+}
+
+# 5.4 Dataset-specific AUC Comparison
+create_dataset_comparison <- function(summary_table) {
+  ggplot(summary_table, aes(x = Method, y = AUC, fill = Method)) +
+    geom_bar(stat = "identity") +
+    facet_wrap(~ Dataset) +
+    geom_text(aes(label = round(AUC, 3)), vjust = -0.5) +
+    labs(title = "AUC Comparison by Dataset",
+         y = "AUC Score") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Generate all visualizations
+performance_heatmap <- create_performance_heatmap(summary_table)
+radar_chart <- create_radar_chart(summary_table)
+ranking_plot <- create_ranking_plot(global_ranking)
+dataset_comparison <- create_dataset_comparison(summary_table)
+
+# Display visualizations
+print(performance_heatmap)
+print(radar_chart)
+print(ranking_plot)
+print(dataset_comparison)
+```
+
+
+```{r regularization_paths_faceted_zoomed}
+library(glmnet)
+library(ggplot2)
+library(reshape2)
+
+plot_regularization_path <- function(X_train, y_train, method = c("LASSO", "RIDGE")) {
+  method <- match.arg(method)
+  alpha_val <- ifelse(method == "LASSO", 1, 0)
+  
+  # Fit glmnet on full training data (no CV, to see full path)
+  fit <- glmnet(X_train, ifelse(y_train=="Tumor",1,0), alpha = alpha_val, family = "binomial")
+  
+  coefs <- as.matrix(fit$beta)
+  df <- melt(coefs)
+  colnames(df) <- c("Feature", "Step", "Coefficient")
+  df$log_lambda <- rep(log(fit$lambda), each = nrow(coefs))
+  
+  ggplot(df, aes(x = log_lambda, y = Coefficient, color = Feature)) +
+    geom_line(show.legend = FALSE) +
+    labs(title = paste(method, "Regularization Path"),
+         x = expression(log(lambda)),
+         y = "Coefficient") +
+    theme_minimal()
+}
+
+# Example: Plot for Lung dataset
+X_train_lung <- t(split_data[["Lung"]]$train_expr)
+y_train_lung <- split_data[["Lung"]]$train_labels
+
+p_lasso <- plot_regularization_path(X_train_lung, y_train_lung, method = "LASSO")
+p_ridge <- plot_regularization_path(X_train_lung, y_train_lung, method = "RIDGE")
+
+# Combine side by side
+library(patchwork)
+p_lasso + p_ridge
+
+```
+
+
+
+
+

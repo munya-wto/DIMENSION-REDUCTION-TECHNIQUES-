@@ -1,0 +1,514 @@
+
+---
+title: "Wrapper Methods: RFE vs Stepwise Selection"
+author: "2555479 Munyaradzi Ndumeya"
+date: "2025-08-20"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+# OPTIONAL ::: To clear the entire history
+
+```{r}
+rm(list = ls(all.names = TRUE), .history)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, results = 'hold')
+set.seed(1996)
+```
+
+# 0) Packages::
+
+```{r libraries}
+library(GEOquery)
+library(caret)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tibble)
+library(smotefamily)
+library(gridExtra)
+library(sva)
+library(patchwork)
+library(kableExtra)
+library(tidyr)
+set.seed(1996)
+```
+
+# 1) Load & Label GEO Datasets
+
+```{r load_data}
+options(timeout = 60000)
+load_GEO_dataset <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)
+  pheno <- pData(gse)
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  tissue_col <- grep("tissue|characteristics|source|description", colnames(pheno),
+                     ignore.case = TRUE, value = TRUE)[1]
+  
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case = TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case = TRUE), "Normal", NA))
+  labels <- factor(labels, levels = c("Normal", "Tumor"))
+  
+  list(expr = expr, pheno = pheno, labels = labels)
+}
+
+datasets <- list(
+  Lung    = "GSE19804",
+  Breast  = "GSE15852",
+  Liver   = "GSE112790",
+  Gastric = "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+# 2) Preprocessing Pipeline with Aggressive Prefilter
+
+```{r preprocessing}
+# 2) Preprocessing Pipeline (minimal version)
+set.seed(1996)
+split_data <- list()
+
+for (nm in names(loaded_data)) {
+  cat("\n=== Processing dataset:", nm, "===\n")
+  
+  X <- loaded_data[[nm]]$expr
+  y <- loaded_data[[nm]]$labels
+  
+  # Train/test split
+  train_idx <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[, train_idx, drop = FALSE]
+  X_test  <- X[, -train_idx, drop = FALSE]
+  y_train <- y[train_idx]
+  y_test  <- y[-train_idx]
+  
+  # Aggressive filter removed – leave balancing + filtering to Step 3
+  split_data[[nm]] <- list(
+    train_expr = X_train,
+    test_expr  = X_test,
+    train_labels = y_train,
+    test_labels  = y_test
+  )
+}
+
+```
+#Cross-validation with balancing + filtering inside each fold
+```{r}
+compare_embedded_methods_fold_balanced <- function(split_data, cv_folds = 3) {
+  results <- list()
+  
+  for (nm in names(split_data)) {
+    cat("\n=== Dataset:", nm, "===\n")
+    
+    X_full   <- split_data[[nm]]$train_expr
+    y_full   <- split_data[[nm]]$train_labels
+    X_test   <- split_data[[nm]]$test_expr
+    y_test   <- split_data[[nm]]$test_labels
+    
+    library(doParallel)
+    registerDoParallel(cores = 2)
+    
+    folds <- createFolds(y_full, k = cv_folds, list = TRUE, returnTrain = TRUE)
+    fold_results <- list(RFE = list(), Stepwise = list())
+    
+    for (i in seq_along(folds)) {
+      train_idx <- folds[[i]]
+      test_idx  <- setdiff(seq_along(y_full), train_idx)
+      
+      # -------------------
+      # BALANCING (inside fold)
+      df_fold <- data.frame(t(X_full[, train_idx, drop = FALSE]), Class = y_full[train_idx])
+      
+      if (nm == "Liver") {
+        smote_result <- SMOTE(X = df_fold[, -ncol(df_fold)], target = df_fold$Class,
+                              K = 5, dup_size = 2)
+        df_bal <- smote_result$data
+        colnames(df_bal)[ncol(df_bal)] <- "Class"
+      } else if (nm == "Gastric") {
+        df_bal <- upSample(x = df_fold[, -ncol(df_fold)], y = df_fold$Class, yname = "Class")
+      } else {
+        df_bal <- upSample(x = df_fold[, -ncol(df_fold)], y = df_fold$Class, yname = "Class")
+      }
+      
+      X_train_bal <- t(as.matrix(df_bal[, -ncol(df_bal)]))
+      y_train_bal <- df_bal$Class
+      X_val <- X_full[, test_idx, drop = FALSE]
+      y_val <- y_full[test_idx]
+      
+      # -------------------
+      # RFE
+      cat("Dataset:", nm, "| RFE | Fold", i, "\n")
+      X_train_rfe <- t(X_train_bal)
+      num_features <- ncol(X_train_rfe)
+      rfe_sizes <- unique(c(20, 50, 100, 200))
+      rfe_sizes <- rfe_sizes[rfe_sizes <= num_features]
+      if (length(rfe_sizes) == 0) rfe_sizes <- min(num_features, 10)
+      
+      ctrl_rfe <- rfeControl(functions = rfFuncs, method = "cv", number = 2, allowParallel = TRUE)
+      rfe_fit <- rfe(x = X_train_rfe, y = y_train_bal,
+                     sizes = rfe_sizes, rfeControl = ctrl_rfe)
+      
+      pred_rfe <- predict(rfe_fit, t(X_val), type = "prob")[, "Tumor"]
+      fold_results$RFE[[i]] <- calculate_metrics(pred_rfe, y_val)
+      
+      # -------------------
+      # SWAG
+      cat("Dataset:", nm, "| SWAG | Fold", i, "\n")
+      X_train_step <- prefilter_stepwise_safe(X_train_bal, top_n = 50)
+      common_genes <- intersect(rownames(X_train_step), rownames(X_val))
+      if (length(common_genes) < 2) next
+      
+      df_step <- data.frame(Class = y_train_bal, t(X_train_step[common_genes, , drop = FALSE]))
+      step_fit <- step(glm(Class ~ 1, data = df_step, family = binomial),
+                       scope = formula(glm(Class ~ ., data = df_step, family = binomial)),
+                       direction = "both", trace = 0)
+      
+      if (length(coef(step_fit)) <= 1) {
+        p_tumor <- mean(y_train_bal == "Tumor")
+        pred_step <- rep(p_tumor, length(y_val))
+      } else {
+        pred_step <- predict(step_fit, newdata = data.frame(t(X_val[common_genes, , drop = FALSE])),
+                             type = "response")
+      }
+      
+      fold_results$Stepwise[[i]] <- calculate_metrics(pred_step, y_val)
+    }
+    
+    stopImplicitCluster()
+    
+    avg_rfe   <- bind_rows(fold_results$RFE)     %>% summarise_all(mean) %>% as.data.frame()
+    avg_step  <- bind_rows(fold_results$Stepwise) %>% summarise_all(mean) %>% as.data.frame()
+    
+    results[[nm]] <- list(RFE = avg_rfe, Stepwise = avg_step)
+    
+    cat("\n=== Completed dataset:", nm, "===\n")
+    print(results[[nm]])
+  }
+  
+  return(results)
+}
+```
+
+
+
+
+```{r}
+set.seed(1996)
+
+# --- Metrics function ---
+calculate_metrics <- function(pred_prob, true_labels) {
+  true_labels <- factor(true_labels, levels = c("Normal", "Tumor"))
+  pred_class <- factor(ifelse(pred_prob > 0.5, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+  cm <- confusionMatrix(pred_class, true_labels, positive = "Tumor")
+  
+  TP <- cm$table["Tumor", "Tumor"]
+  TN <- cm$table["Normal", "Normal"]
+  FP <- cm$table["Tumor", "Normal"]
+  FN <- cm$table["Normal", "Tumor"]
+  den <- sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+  MCC <- ifelse(den > 0, (TP*TN - FP*FN)/den, NA)
+  
+  roc_obj <- tryCatch({
+    roc(response = true_labels, predictor = pred_prob, levels = rev(levels(true_labels)))
+  }, error = function(e) NULL)
+  
+  auc_val <- if (!is.null(roc_obj)) as.numeric(auc(roc_obj)) else NA
+  
+  data.frame(
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    AUC = auc_val,
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    Precision = as.numeric(cm$byClass["Pos Pred Value"]),
+    F1 = as.numeric(cm$byClass["F1"]),
+    MCC = MCC,
+    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"])
+  )
+}
+
+# --- Safe Prefilter ---
+prefilter_genes_safe <- function(X, top_n = 50) {
+  if (nrow(X) == 0) return(X)
+  top_n_safe <- min(top_n, nrow(X))
+  vars <- apply(X, 1, var)
+  top_genes <- names(sort(vars, decreasing = TRUE))[1:top_n_safe]
+  X[top_genes, , drop = FALSE]
+}
+
+# --- SWAG Sparse Wrapper Algorithm ---
+swag_wrapper <- function(X_train, y_train, X_test, max_genes = 10) {
+  # Only keep genes with variance
+  nzv <- apply(X_train, 1, var) > 0
+  X_train <- X_train[nzv, , drop = FALSE]
+  X_test  <- X_test[nzv, , drop = FALSE]
+  
+  if(nrow(X_train) < 2) return(rep(mean(y_train == "Tumor"), ncol(X_test)))
+  
+  # Sparse logistic regression using glmnet
+  library(glmnet)
+  y_num <- ifelse(y_train == "Tumor", 1, 0)
+  cvfit <- cv.glmnet(t(X_train), y_num, family="binomial", alpha=1, nfolds=3)
+  
+  pred_prob <- predict(cvfit, newx=t(X_test), s="lambda.min", type="response")[,1]
+  return(pred_prob)
+}
+
+# --- Main workflow ---
+compare_embedded_methods_swag <- function(split_data, cv_folds = 3) {
+  results <- list()
+  
+  for (nm in names(split_data)) {
+    cat("\n=== Dataset:", nm, "===\n")
+    
+    X_full <- split_data[[nm]]$train_expr
+    y_full <- split_data[[nm]]$train_labels
+    X_test_full <- split_data[[nm]]$test_expr
+    y_test_full <- split_data[[nm]]$test_labels
+    
+    library(doParallel)
+    registerDoParallel(cores = 2)
+    
+    folds <- createFolds(y_full, k = cv_folds, list = TRUE, returnTrain = TRUE)
+    fold_results <- list(RFE = list(), SWAG = list())
+    
+    for (i in seq_along(folds)) {
+      train_idx <- folds[[i]]
+      test_idx <- setdiff(seq_along(y_full), train_idx)
+      
+      y_train_fold <- y_full[train_idx]
+      y_test_fold  <- y_full[test_idx]
+      
+      # Skip fold if only one class
+      if(length(unique(y_train_fold)) < 2) {
+        warning(paste("Fold", i, "dataset", nm, "has only one class. Skipping fold."))
+        next
+      }
+      
+      ## --- RFE ---
+      cat("Dataset:", nm, "| Method: RFE | Fold", i, "/", length(folds), "...\n")
+      X_train_rfe <- t(X_full[, train_idx, drop = FALSE])
+      X_test_rfe  <- t(X_full[, test_idx, drop = FALSE])
+      
+      num_features <- ncol(X_train_rfe)
+      rfe_sizes <- unique(c(5,10,20,50))
+      rfe_sizes <- rfe_sizes[rfe_sizes <= num_features]
+      if(length(rfe_sizes) == 0 & num_features > 0) rfe_sizes <- num_features
+      
+      if(num_features >= 2) {
+        ctrl_rfe <- rfeControl(functions = rfFuncs, method = "cv", number = 2, allowParallel = TRUE)
+        rfe_fit <- rfe(x = X_train_rfe, y = y_train_fold,
+                       sizes = rfe_sizes, rfeControl = ctrl_rfe)
+        pred_rfe <- predict(rfe_fit, X_test_rfe, type = "prob")[, "Tumor"]
+        
+        if(length(pred_rfe) == length(y_test_fold)) {
+          fold_results$RFE[[i]] <- calculate_metrics(pred_rfe, y_test_fold)
+        } else {
+          warning(paste("RFE fold", i, "dataset", nm, "- prediction length mismatch. Skipping."))
+        }
+      }
+      
+      ## --- SWAG ---
+      cat("Dataset:", nm, "| Method: SWAG | Fold", i, "/", length(folds), "...\n")
+      X_train_swag <- prefilter_genes_safe(X_full[, train_idx, drop = FALSE], top_n=50)
+      common_genes <- intersect(rownames(X_train_swag), rownames(X_full))
+      X_train_swag <- X_train_swag[common_genes, , drop=FALSE]
+      X_test_swag  <- X_full[common_genes, test_idx, drop=FALSE]
+      
+      if(nrow(X_train_swag) < 2) {
+        warning(paste("SWAG fold", i, "dataset", nm, "- not enough genes. Skipping fold."))
+        next
+      }
+      
+      pred_swag <- swag_wrapper(X_train_swag, y_train_fold, X_test_swag, max_genes = 10)
+      
+      if(length(pred_swag) != length(y_test_fold)) {
+        warning(paste("SWAG fold", i, "dataset", nm, "- prediction length mismatch. Skipping fold."))
+        next
+      }
+      
+      fold_results$SWAG[[i]] <- calculate_metrics(pred_swag, y_test_fold)
+    }
+    
+    stopImplicitCluster()
+    
+    # Average metrics safely
+    avg_rfe <- if(length(fold_results$RFE) > 0) bind_rows(fold_results$RFE) %>% summarise_all(mean, na.rm=TRUE) else NA
+    avg_swag <- if(length(fold_results$SWAG) > 0) bind_rows(fold_results$SWAG) %>% summarise_all(mean, na.rm=TRUE) else NA
+    
+    results[[nm]] <- list(RFE = avg_rfe, SWAG = avg_swag)
+    
+    cat("\n=== Completed dataset:", nm, "===\n")
+    cat("RFE metrics:\n"); print(round(avg_rfe, 3))
+    cat("SWAG metrics:\n"); print(round(avg_swag, 3))
+  }
+  
+  return(results)
+}
+
+
+embedded_results_swag <- compare_embedded_methods_swag(split_data)
+
+```
+
+
+# 4) Results Extraction and Summary Tables
+
+```{r results_summary}
+create_summary_table <- function(results) {
+  summary_data <- data.frame()
+  
+  for (dataset_name in names(results)) {
+    dataset_results <- results[[dataset_name]]
+    
+    for (method_name in names(dataset_results)) {
+      method_metrics <- dataset_results[[method_name]]
+      
+      # Skip if no metrics for this method
+      if(is.null(method_metrics) || length(method_metrics) == 0) {
+        warning(paste("No metrics captured for", dataset_name, method_name))
+        next
+      }
+      
+      # If it's a single row vector (already averaged), convert to data.frame
+      if(is.vector(method_metrics)) {
+        method_metrics <- as.data.frame(t(method_metrics))
+      }
+      
+      # Handle if method_metrics has Baseline column
+      baseline_used <- FALSE
+      if("Baseline" %in% colnames(method_metrics)) {
+        baseline_used <- any(method_metrics$Baseline)
+      }
+      
+      # Average numeric columns (ignore Baseline)
+      numeric_cols <- setdiff(colnames(method_metrics), "Baseline")
+      avg_metrics <- colMeans(method_metrics[, numeric_cols, drop = FALSE], na.rm = TRUE)
+      
+      summary_data <- rbind(summary_data, data.frame(
+        Dataset = dataset_name,
+        Method = method_name,
+        Accuracy = avg_metrics["Accuracy"],
+        AUC = avg_metrics["AUC"],
+        Sensitivity = avg_metrics["Sensitivity"],
+        Specificity = avg_metrics["Specificity"],
+        Precision = avg_metrics["Precision"],
+        F1 = avg_metrics["F1"],
+        MCC = avg_metrics["MCC"],
+        Balanced_Accuracy = avg_metrics["Balanced_Accuracy"],
+        BaselineUsed = baseline_used,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  return(summary_data)
+}
+
+create_global_ranking <- function(summary_data) {
+  global_ranking <- summary_data %>%
+    group_by(Method) %>%
+    summarise(
+      Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+      Mean_AUC = mean(AUC, na.rm = TRUE),
+      Mean_F1 = mean(F1, na.rm = TRUE),
+      Mean_Specificity = mean(Specificity, na.rm = TRUE),
+      Mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
+      SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+      SD_AUC = sd(AUC, na.rm = TRUE),
+      Datasets = n()
+    ) %>%
+    mutate(
+      Accuracy_Rank = rank(-Mean_Accuracy),
+      AUC_Rank = rank(-Mean_AUC),
+      F1_Rank = rank(-Mean_F1),
+      Specificity_Rank = rank(-Mean_Specificity),
+      Overall_Rank = (Accuracy_Rank + AUC_Rank + F1_Rank + Specificity_Rank) / 4
+    ) %>%
+    arrange(Overall_Rank)
+  
+  return(global_ranking)
+}
+
+# --- Run safely ---
+summary_table <- create_summary_table(embedded_results_swag)  # use the SWAG workflow results
+if(nrow(summary_table) == 0) {
+  stop("No metrics were captured. Check if SWAG or RFE folds were skipped.")
+}
+
+global_ranking <- create_global_ranking(summary_table)
+
+# --- Display results ---
+cat("\n=== COMPREHENSIVE PERFORMANCE RESULTS ===\n")
+print(
+  kable(summary_table, digits = 3, 
+        caption = "Performance Metrics: RFE vs Stepwise Selection") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE)
+)
+
+cat("\n=== GLOBAL PERFORMANCE RANKING ===\n")
+print(
+  kable(global_ranking, digits = 3, 
+        caption = "Overall Performance Across All Datasets") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE)
+)
+
+# --- Check best methods per metric ---
+if(nrow(global_ranking) > 0) {
+  best_metrics <- data.frame(
+    Metric = c("Accuracy", "AUC", "F1-Score", "Specificity"),
+    Best_Method = c(
+      global_ranking$Method[which.max(global_ranking$Mean_Accuracy)],
+      global_ranking$Method[which.max(global_ranking$Mean_AUC)],
+      global_ranking$Method[which.max(global_ranking$Mean_F1)],
+      global_ranking$Method[which.max(global_ranking$Mean_Specificity)]
+    ),
+    Value = round(c(
+      max(global_ranking$Mean_Accuracy),
+      max(global_ranking$Mean_AUC),
+      max(global_ranking$Mean_F1),
+      max(global_ranking$Mean_Specificity)
+    ), 3)
+  )
+  
+  print(
+    kable(best_metrics, digits = 3, 
+          caption = "Best Performing Method for Each Key Metric") %>%
+      kable_styling(bootstrap_options = c("striped", "hover"),
+                    full_width = FALSE)
+  )
+}
+
+cat("\n=== SUMMARY COMPLETE ===\n")
+```
+
+
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# Reshape metrics for plotting
+metrics_long <- summary_table %>%
+  pivot_longer(cols = c("Accuracy","AUC","F1","Specificity"),
+               names_to = "Metric", values_to = "Value")
+
+ggplot(metrics_long, aes(x = Dataset, y = Value, fill = Method)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title="Performance Metrics by Method and Dataset",
+       y="Metric Value", x="Dataset") +
+  scale_fill_brewer(palette="Set2")
+```
+
+
+
+
