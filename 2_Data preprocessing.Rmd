@@ -1,0 +1,649 @@
+
+---
+title: "Data Cleaning, Preprocessing, and Preliminary Learning Curves"
+author: "2555479 Munyaradzi Ndumeya"
+date: "2025-08-28"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, results = 'hold')
+set.seed(1996)
+```
+
+# ===========================================
+
+# 0) Load Required Libraries
+
+# ===========================================
+
+```{r}
+library(GEOquery)
+library(ggplot2)
+library(reshape2)
+library(tibble)
+library(gridExtra)
+library(pheatmap)
+library(RColorBrewer)
+library(stats)
+library(caret)
+library(DMwR)   # SMOTE
+library(sva)    # ComBat
+library(pROC)
+```
+
+# ===========================================
+
+# 1) Load & Label GEO Datasets
+
+# ===========================================
+
+```{r}
+load_GEO_dataset <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)
+  pheno <- pData(gse)
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  # Label extraction
+  tissue_col <- grep("tissue|characteristics|source|description", 
+                     colnames(pheno), ignore.case = TRUE, value = TRUE)[1]
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case = TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case = TRUE), "Normal", NA))
+  labels <- factor(labels, levels = c("Normal", "Tumor"))
+  
+  list(expr = expr, pheno = pheno, labels = labels)
+}
+
+datasets <- list(
+  Lung   = "GSE19804",
+  Breast = "GSE15852",
+  Liver  = "GSE112790",
+  Gastric= "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+# ===========================================
+
+# 2) Initial QC & Raw Data Visualization
+
+# ===========================================
+
+```{r}
+for (nm in names(loaded_data)) {
+  X <- loaded_data[[nm]]$expr
+  y <- loaded_data[[nm]]$labels
+  cat("\n### Dataset:", nm, "###\n")
+  cat("Samples:", ncol(X), " | Features:", nrow(X), "\n")
+  cat("Class distribution:\n"); print(table(y))
+  cat("Missing values:", sum(is.na(X)), "\n")
+  vars <- apply(t(X), 2, var)
+  cat("Variance range:", min(vars), "to", max(vars), "\n")
+  cat("Duplicate samples:", sum(duplicated(t(X))), "\n")
+}
+
+```
+```{r}
+# ===========================================
+# 2) Boxplots of Raw Expression (Corrected)
+# ===========================================
+library(ggplot2)
+library(reshape2)
+
+for (nm in names(loaded_data)) {
+  X <- loaded_data[[nm]]$expr  # genes x samples
+  df <- as.data.frame(X)
+  
+  # Preserve gene IDs for melting
+  df$Gene <- rownames(df)
+  
+  # Melt data for ggplot2
+  df_melt <- melt(df, id.vars = "Gene", variable.name = "Sample", value.name = "Expression")
+  
+  # Generate boxplot
+  p <- ggplot(df_melt, aes(x = Sample, y = Expression)) +
+       geom_boxplot(outlier.size = 0.5, fill = "skyblue") +
+       ggtitle(paste("Expression Distribution —", nm)) +
+       xlab("Samples") +
+       ylab("Expression") +
+       theme_minimal() +
+       theme(axis.text.x = element_blank())  # hide sample labels for readability
+  
+  print(p)
+}
+```
+
+
+
+```{r}
+# ===========================================
+# 2) Boxplots of Raw Expression (First 10 Samples Only)
+# ===========================================
+library(ggplot2)
+library(reshape2)
+
+for (nm in names(loaded_data)) {
+  X <- loaded_data[[nm]]$expr  # genes x samples
+  
+  # Keep only the first 10 samples (columns)
+  if (ncol(X) > 10) {
+    X <- X[, 1:10]
+  }
+  
+  df <- as.data.frame(X)
+  
+  # Preserve gene IDs for melting
+  df$Gene <- rownames(df)
+  
+  # Melt data for ggplot2
+  df_melt <- melt(df, id.vars = "Gene", variable.name = "Sample", value.name = "Expression")
+  
+  # Generate boxplot
+  p <- ggplot(df_melt, aes(x = Sample, y = Expression)) +
+       geom_boxplot(outlier.size = 0.5, fill = "skyblue") +
+       ggtitle(paste("Expression Distribution —", nm, "(First 10 Samples)")) +
+       xlab("Samples") +
+       ylab("Expression") +
+       theme_minimal() +
+       theme(axis.text.x = element_blank())  # hide sample labels for readability
+  
+  print(p)
+}
+```
+
+
+
+#                     --------------------------
+#                       5. Descriptive Metrics
+#                     --------------------------
+
+```{r Descriptive Statistics}
+
+# Function to compute descriptive statistics for each dataset
+describe_dataset <- function(name, dataset) {
+  expr <- dataset$expr
+  labels <- dataset$labels
+  
+  # Sample-level statistics
+  sample_means <- colMeans(expr)
+  sample_sds   <- apply(expr, 2, sd)
+  
+  # Gene-level statistics
+  gene_means <- rowMeans(expr)
+  gene_sds   <- apply(expr, 1, sd)
+  
+  stats <- data.frame(
+    Dataset = name,
+    Samples = ncol(expr),
+    Genes = nrow(expr),
+    Normal = sum(labels == "Normal"),
+    Tumor = sum(labels == "Tumor"),
+    Tumor_to_Normal = round(sum(labels == "Tumor") / sum(labels == "Normal"), 2),
+    MeanExpr_perSample = round(mean(sample_means), 2),
+    SDExpr_perSample = round(mean(sample_sds), 2),
+    MeanExpr_perGene = round(mean(gene_means), 2),
+    SDExpr_perGene = round(mean(gene_sds), 2)
+  )
+  return(stats)
+}
+
+# Apply to all datasets
+desc_stats_list <- lapply(names(loaded_data), function(name) {
+  describe_dataset(name, loaded_data[[name]])
+})
+
+desc_summary <- do.call(rbind, desc_stats_list)
+
+cat("\n===== Descriptive Statistics Summary =====\n")
+print(desc_summary)
+
+#====================  5. Visual Explorations ====================#
+
+# Boxplots of sample expression distributions
+par(mfrow=c(2,3))
+for (name in names(loaded_data)) {
+  expr <- loaded_data[[name]]$expr
+  boxplot(expr[,1:10], main=paste(name, "- first 10 samples"),
+          las=2, outline=FALSE, col="lightblue",
+          ylab="Expression (log2 intensity)")
+}
+
+# PCA plots for each dataset (Normal vs Tumor separation)
+par(mfrow=c(2,3))
+for (name in names(loaded_data)) {
+  expr <- loaded_data[[name]]$expr
+  labels <- loaded_data[[name]]$labels
+  pca <- prcomp(t(expr), scale.=TRUE)
+  
+  plot(pca$x[,1:2], col=labels, pch=19,
+       main=paste(name, "PCA"),
+       xlab="PC1", ylab="PC2")
+  legend("topright", legend=levels(labels),
+         col=1:2, pch=19, bty="n")
+}
+
+# Density plots of expression values
+par(mfrow=c(2,3))
+for (name in names(loaded_data)) {
+  expr <- loaded_data[[name]]$expr
+  plot(density(expr[,1]), col="darkblue", lwd=2,
+       main=paste(name, "- Expression Density"),
+       xlab="Expression value")
+  for (i in 2:5) {
+    lines(density(expr[,i]), col=adjustcolor("darkblue", alpha=0.4))
+  }
+}
+```
+
+
+
+
+
+```{r Before Standardisation}
+library(ggplot2)
+
+for (nm in names(loaded_data)) {
+  # Use raw expression matrix
+  expr_raw <- loaded_data[[nm]]$expr
+  
+  # Convert to a long vector for ggplot
+  df <- data.frame(Value = as.vector(expr_raw))
+  
+  # Create density plot
+  B4 <- ggplot(df, aes(x = Value)) +
+       geom_density(fill = "darkblue", alpha = 0.6) +
+       ggtitle(paste("Density of Raw Expression Values —", nm)) +
+       xlab("Expression (log2 scale)") + 
+       ylab("Density") +
+       theme_minimal()
+  
+  print(B4)
+}
+```
+
+
+# ===========================================
+
+# 3) Preliminary Learning Curves (Before Train/Test Split)
+
+# ===========================================
+
+```{r}
+plot_learning_curve <- function(X, y, dataset_name, steps = 5, seed = 1996, top_genes = 200) {
+  set.seed(seed)
+  sizes <- seq(0.1, 1.0, length.out = steps)
+  accs <- c()
+  aucs <- c()
+  
+  # reduce dimensionality to top variable genes
+  vars <- apply(X, 2, var)
+  top_idx <- order(vars, decreasing = TRUE)[1:min(top_genes, ncol(X))]
+  X <- X[, top_idx]
+  
+  # Ensure column names are syntactically valid
+  colnames(X) <- make.names(colnames(X))
+  
+  for (s in sizes) {
+    idx <- createDataPartition(y, p = s, list = FALSE)
+    Xtr <- X[idx, , drop = FALSE]
+    ytr <- y[idx]
+    Xte <- X[-idx, , drop = FALSE]
+    yte <- y[-idx]
+    
+    if (length(unique(yte)) < 2) next
+    
+    df <- as.data.frame(Xtr)
+    df$Class <- ytr
+    mdl <- glm(Class ~ ., data = df, family = binomial)
+    
+    prob <- predict(mdl, newdata = as.data.frame(Xte), type = "response")
+    pred <- factor(ifelse(prob > 0.5, "Tumor", "Normal"), levels = levels(y))
+    cm <- confusionMatrix(pred, yte, positive = "Tumor")
+    roc_obj <- roc(yte, prob, levels = rev(levels(yte)), quiet = TRUE)
+    
+    accs <- c(accs, cm$overall["Accuracy"])
+    aucs <- c(aucs, auc(roc_obj))
+  }
+  
+  df_res <- data.frame(
+    TrainSize = sizes[1:length(accs)] * 100,
+    Accuracy = accs,
+    AUC = aucs
+  )
+  
+  p <- ggplot(df_res, aes(x = TrainSize)) +
+       geom_line(aes(y = Accuracy, color = "Accuracy"), size = 1.2) +
+       geom_point(aes(y = Accuracy, color = "Accuracy"), size = 2) +
+       geom_line(aes(y = AUC, color = "AUC"), size = 1.2, linetype = "dashed") +
+       geom_point(aes(y = AUC, color = "AUC"), size = 2, shape = 17) +
+       labs(title = paste("Learning Curve —", dataset_name),
+            x = "Training Set Size (%)", y = "Metric Value") +
+       ylim(0,1) +
+       theme_minimal() +
+       scale_color_manual(values = c("Accuracy" = "steelblue", "AUC" = "darkred"))
+  
+  return(p)
+}
+```
+
+# ===========================================
+# 3) Generate learning curves for all datasets
+# ===========================================
+```{r}
+for (nm in names(loaded_data)) {
+  cat("\n### Learning Curve —", nm, "###\n")
+  X <- t(loaded_data[[nm]]$expr)  # samples x genes
+  y <- loaded_data[[nm]]$labels
+  p <- plot_learning_curve(X, y, nm, steps = 6, top_genes = 200)
+  print(p)
+}
+```
+
+
+
+# ===========================================
+
+# 4) Train/Test Split
+
+# ===========================================
+
+```{r}
+split_data <- list()
+for (nm in names(loaded_data)) {
+  X <- t(loaded_data[[nm]]$expr)
+  y <- loaded_data[[nm]]$labels
+  
+  train_idx <- createDataPartition(y, p = 0.7, list = FALSE)
+  split_data[[nm]] <- list(
+    train_expr = t(X[train_idx, ]),
+    test_expr  = t(X[-train_idx, ]),
+    train_pheno= data.frame(disease_state = y[train_idx]),
+    test_pheno = data.frame(disease_state = y[-train_idx])
+  )
+}
+```
+
+# ===========================================
+
+# 5) Preprocessing on Training Set Only
+
+# ===========================================
+
+```{r}
+# 5.1 Variance filtering
+for (nm in names(split_data)) {
+  train_expr <- split_data[[nm]]$train_expr
+  test_expr  <- split_data[[nm]]$test_expr
+  vars <- apply(train_expr, 1, var)
+  keep <- vars > quantile(vars, 0.2)  # top 80% variable genes
+  split_data[[nm]]$train_expr <- train_expr[keep, ]
+  split_data[[nm]]$test_expr  <- test_expr[keep, ]
+  cat(nm, ": retained", sum(keep), "genes\n")
+}
+
+
+
+
+
+
+# 5.2 Class imbalance
+for (nm in names(split_data)) {
+  train_expr <- t(split_data[[nm]]$train_expr)
+  train_labels <- as.factor(split_data[[nm]]$train_pheno$disease_state)
+  df_train <- data.frame(train_expr, label = train_labels)
+  
+  if (min(table(train_labels))/max(table(train_labels)) < 0.5) {
+    df_train_bal <- SMOTE(label ~ ., data = df_train)
+  } else {
+    df_train_bal <- upSample(x=df_train[, -ncol(df_train)], y=df_train$label)
+  }
+  
+  split_data[[nm]]$train_expr <- t(as.matrix(df_train_bal[, -ncol(df_train_bal)]))
+  split_data[[nm]]$train_labels <- df_train_bal$label
+  cat(nm, ": class balance applied\n"); print(table(split_data[[nm]]$train_labels))
+}
+
+
+
+
+
+# 5.3 Standardization (Z-score using training mean/SD)
+for (nm in names(split_data)) {
+  train_expr <- split_data[[nm]]$train_expr
+  test_expr  <- split_data[[nm]]$test_expr
+  gene_means <- rowMeans(train_expr)
+  gene_sds   <- apply(train_expr, 1, sd)
+  
+  train_scaled <- (train_expr - gene_means)/gene_sds
+  test_scaled  <- (test_expr - gene_means)/gene_sds
+  
+  split_data[[nm]]$train_expr <- train_scaled
+  split_data[[nm]]$test_expr  <- test_scaled
+}
+
+
+
+
+
+# 5.4 Batch effect correction (optional)
+library(sva)
+
+for (nm in names(split_data)) {
+  train_expr <- split_data[[nm]]$train_expr
+  test_expr  <- split_data[[nm]]$test_expr
+  
+  # Only proceed if batch info exists in training
+  if (!is.null(split_data[[nm]]$train_pheno$batch) &&
+      length(unique(split_data[[nm]]$train_pheno$batch)) > 1) {
+    
+    # Training batch vector
+    batch_train <- split_data[[nm]]$train_pheno$batch
+    
+    # Optionally include covariates (e.g., disease state)
+    mod_train <- model.matrix(~1, data = split_data[[nm]]$train_pheno)
+    
+    # Fit ComBat on training set only
+    combat_train <- ComBat(dat = train_expr, batch = batch_train, mod = mod_train, par.prior = TRUE, prior.plots = FALSE)
+    
+    # Adjust test set using estimated parameters from training
+    # ComBat function doesn’t directly provide a "predict" method.
+    # Workaround: use the same batch effect means/variances as training
+    # For small batch effects, using training mean/SD as scaling for test is common
+    # Or use the "ref.batch" parameter if available:
+    if (!is.null(split_data[[nm]]$test_pheno$batch)) {
+      batch_test <- split_data[[nm]]$test_pheno$batch
+      combat_test <- ComBat(dat = test_expr, batch = batch_test, mod = mod_train,
+                            par.prior = TRUE, prior.plots = FALSE, 
+                            ref.batch = batch_train[1])  # first training batch as reference
+      split_data[[nm]]$test_expr <- combat_test
+    }
+    
+    split_data[[nm]]$train_expr <- combat_train
+    cat(nm, ": batch correction applied (train only)\n")
+  } else {
+    cat(nm, ": no batch correction needed\n")
+  }
+}
+
+# 5.5 Final QC
+for (nm in names(split_data)) {
+  cat("\n=== ", nm, " ===\n")
+  cat("Training samples:", ncol(split_data[[nm]]$train_expr), "\n")
+  cat("Test samples:", ncol(split_data[[nm]]$test_expr), "\n")
+  cat("Training class distribution:\n"); print(table(split_data[[nm]]$train_labels))
+  cat("Test class distribution:\n"); print(table(split_data[[nm]]$test_pheno$disease_state))
+  cat("Any NA in train?", any(is.na(split_data[[nm]]$train_expr)), "\n")
+  cat("Any NA in test?", any(is.na(split_data[[nm]]$test_expr)), "\n")
+}
+```
+
+
+
+```{r Density plots after standasisation}
+library(ggplot2)
+
+for (nm in names(split_data)) {
+  train_scaled <- split_data[[nm]]$train_expr
+  
+  df <- data.frame(Value = as.vector(train_scaled))
+  
+  d <- ggplot(df, aes(x = Value)) +
+       geom_density(fill = "darkblue", alpha = 0.6) +
+       ggtitle(paste("Density of Standardized Values —", nm)) +
+       xlab("Z-score (standardized expression)") + ylab("Density") +
+       theme_minimal()
+  
+  print(d)
+}
+
+```
+
+
+````{r Class proportion before and after balancing}
+library(ggplot2)
+library(dplyr)
+
+classes <- c("Normal", "Tumor")  # fixed class order
+
+for (nm in names(split_data)) {
+
+  # --- Original labels (before balancing) ---
+  orig_labels <- split_data[[nm]]$train_pheno$disease_state
+  orig_labels <- factor(orig_labels, levels = classes)
+  df_orig <- as.data.frame(table(orig_labels))
+  colnames(df_orig) <- c("Class", "Count")
+  df_orig$Proportion <- df_orig$Count / sum(df_orig$Count)
+  df_orig$Type <- "Before Balancing"
+
+  # --- Balanced labels ---
+  bal_labels <- split_data[[nm]]$train_labels
+  bal_labels <- factor(bal_labels, levels = classes)
+  df_bal <- as.data.frame(table(bal_labels))
+  colnames(df_bal) <- c("Class", "Count")
+  df_bal$Proportion <- df_bal$Count / sum(df_bal$Count)
+  df_bal$Type <- "After Balancing"
+
+  # Combine
+  df_plot <- rbind(df_orig, df_bal)
+
+  # Pie chart
+  p <- ggplot(df_plot, aes(x = "", y = Proportion, fill = Class)) +
+       geom_bar(stat = "identity", width = 1, color = "white") +
+       coord_polar(theta = "y") +
+       facet_wrap(~Type) +
+       labs(title = paste("Class Proportion —", nm), y = NULL, x = NULL) +
+       theme_void() +
+       theme(legend.position = "bottom") +
+       scale_fill_brewer(palette = "Set2")
+
+  print(p)
+}
+````
+
+````{r}
+# ===========================================
+# 3) Preliminary Learning Curves (Before Train/Test Split)
+# ===========================================
+
+plot_learning_curve <- function(X, y, dataset_name, steps = 5, seed = 1996, top_genes = 200) {
+  set.seed(seed)
+  sizes <- seq(0.1, 1.0, length.out = steps)
+  accs <- c()
+  aucs <- c()
+  
+  # reduce dimensionality to top variable genes
+  vars <- apply(X, 2, var)
+  top_idx <- order(vars, decreasing = TRUE)[1:min(top_genes, ncol(X))]
+  X <- X[, top_idx]
+  
+  # Ensure column names are syntactically valid
+  colnames(X) <- make.names(colnames(X))
+  
+  for (s in sizes) {
+    idx <- createDataPartition(y, p = s, list = FALSE)
+    Xtr <- X[idx, , drop = FALSE]
+    ytr <- y[idx]
+    Xte <- X[-idx, , drop = FALSE]
+    yte <- y[-idx]
+    
+    if (length(unique(yte)) < 2) next
+    
+    df <- as.data.frame(Xtr)
+    df$Class <- ytr
+    mdl <- glm(Class ~ ., data = df, family = binomial)
+    
+    prob <- predict(mdl, newdata = as.data.frame(Xte), type = "response")
+    pred <- factor(ifelse(prob > 0.5, "Tumor", "Normal"), levels = levels(y))
+    cm <- confusionMatrix(pred, yte, positive = "Tumor")
+    roc_obj <- roc(yte, prob, levels = rev(levels(yte)), quiet = TRUE)
+    
+    accs <- c(accs, cm$overall["Accuracy"])
+    aucs <- c(aucs, auc(roc_obj))
+  }
+  
+  df_res <- data.frame(
+    TrainSize = sizes[1:length(accs)] * 100,
+    Accuracy = accs,
+    AUC = aucs
+  )
+  
+  p <- ggplot(df_res, aes(x = TrainSize)) +
+       geom_line(aes(y = Accuracy, color = "Accuracy"), size = 2.5, alpha = 0.9) +  # Solid blue line
+       geom_point(aes(y = Accuracy, color = "Accuracy"), size = 4) +  # Blue circles
+       geom_line(aes(y = AUC, color = "AUC"), size = 2.5, linetype = "solid", alpha = 0.9) +  # SOLID red line
+       geom_point(aes(y = AUC, color = "AUC"), size = 4, shape = 17) +  # Red triangles
+       labs(title = paste(dataset_name),
+            x = "Training Set Size (%)", y = "Metric Value") +
+       ylim(0,1) +
+       theme_minimal() +
+       scale_color_manual(values = c("Accuracy" = "#000080", "AUC" = "#FF0000")) +  # EXACT PCA colors
+       theme(
+         plot.title = element_text(hjust = 0.5, face = "bold", size = 14, color = "black"),
+         axis.title = element_text(face = "bold", size = 12, color = "black"),
+         axis.text = element_text(face = "bold", size = 10, color = "black"),
+         legend.title = element_text(face = "bold", size = 12, color = "black"),
+         legend.text = element_text(face = "bold", size = 11, color = "black"),
+         panel.grid.major = element_line(color = "gray50", size = 0.3),
+         panel.grid.minor = element_line(color = "gray70", size = 0.2),
+         legend.position = "bottom"
+       )
+  
+  return(p)
+}
+
+# ===========================================
+# Generate learning curves for all datasets
+# ===========================================
+
+library(patchwork)
+
+# Create list to store plots
+learning_plots <- list()
+
+for (nm in names(loaded_data)) {
+  cat("\n### Learning Curve —", nm, "###\n")
+  X <- t(loaded_data[[nm]]$expr)  # samples x genes
+  y <- loaded_data[[nm]]$labels
+  p <- plot_learning_curve(X, y, nm, steps = 6, top_genes = 200)
+  learning_plots[[nm]] <- p
+}
+
+# Combine plots using patchwork for faceted PDF
+combined_learning_plot <- (learning_plots$Lung + learning_plots$Breast) / 
+                         (learning_plots$Liver + learning_plots$Gastric) +
+    plot_layout(guides = 'collect') &
+    theme(legend.position = 'bottom')
+
+# Save to PDF with maximum quality
+pdf("Learning_Curves_ULTRA_BOLD.pdf", width = 12, height = 10, pointsize = 14)
+print(combined_learning_plot)
+dev.off()
+
+cat("ULTRA BOLD Learning Curves PDF saved as 'Learning_Curves_ULTRA_BOLD.pdf'\n")
+````
+
+
