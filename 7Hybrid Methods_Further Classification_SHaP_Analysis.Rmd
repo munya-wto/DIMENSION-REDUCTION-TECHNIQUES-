@@ -1,0 +1,1097 @@
+
+---
+title: "Hybrid + Clasification + SHAP VALUES"
+author: "Munyaradzi Ndumeya"
+date: "2025-09-15"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+# OPTIONAL ::: To clear the entire history
+````{r}
+rm(list = ls(all.names = TRUE), .history)
+````
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, results='hold')
+set.seed(1996)
+```
+
+## 0) Libraries
+
+```{r libraries}
+library(GEOquery)
+library(caret)
+library(mRMRe)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(mixOmics)
+library(glmnet)
+library(MASS)
+library(UpSetR)
+library(doParallel)
+set.seed(1996)
+```
+
+## 1) Load GEO Datasets
+
+```{r load-datasets}
+load_GEO_dataset <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)
+  pheno <- pData(gse)
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  tissue_col <- grep("tissue|characteristics|source|description",
+                     colnames(pheno), ignore.case=TRUE, value=TRUE)[1]
+  
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case=TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case=TRUE), "Normal", NA))
+  labels <- factor(labels, levels=c("Normal","Tumor"))
+  
+  list(expr=expr, pheno=pheno, labels=labels)
+}
+
+datasets <- list(
+  Lung    = "GSE19804",
+  Breast  = "GSE15852",
+  Liver   = "GSE112790",
+  Gastric = "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+## 2) PREPROCESSING
+
+```{r split-preprocess}
+preprocessed_data <- list()
+for (nm in names(loaded_data)) {
+  cat("\n=== Dataset:", nm, "===\n")
+  
+  X <- t(loaded_data[[nm]]$expr)
+  y <- loaded_data[[nm]]$labels
+  
+  # Remove samples with NA labels
+  valid_samples <- !is.na(y)
+  X <- X[valid_samples, ]
+  y <- y[valid_samples]
+  
+  idx <- createDataPartition(y, p=0.7, list=FALSE)
+  
+  # Variance filtering on training data only
+  x_train <- X[idx, , drop=FALSE]
+  vars <- apply(x_train, 2, var)
+  cutoff <- quantile(vars, probs=0.2)
+  keep_features <- vars >= cutoff
+  
+  preprocessed_data[[nm]] <- list(
+    x_train = x_train[, keep_features, drop=FALSE],
+    y_train = y[idx],
+    x_test  = X[-idx, keep_features, drop=FALSE],
+    y_test  = y[-idx]
+  )
+  
+  cat("Training samples:", nrow(preprocessed_data[[nm]]$x_train), "\n")
+  cat("Test samples:", nrow(preprocessed_data[[nm]]$x_test), "\n")
+  cat("Features after variance filtering:", ncol(preprocessed_data[[nm]]$x_train), "\n")
+}
+```
+
+## 3) mRMR Feature Selection
+
+```{r mrmr-selection}
+mrmr_results <- list()
+
+for (nm in names(preprocessed_data)) {
+  cat("\n=== Running mRMR for:", nm, "===\n")
+  
+  x_train <- preprocessed_data[[nm]]$x_train
+  y_train <- preprocessed_data[[nm]]$y_train
+  
+  # Chunked selection
+  chunk_size <- 5000
+  feature_chunks <- split(colnames(x_train), ceiling(seq_along(colnames(x_train))/chunk_size))
+  selected_feats <- c()
+  
+  for(chunk in feature_chunks){
+    df_chunk <- data.frame(x_train[, chunk, drop=FALSE], target=as.numeric(y_train))
+    data_chunk <- mRMR.data(data=df_chunk)
+    res <- mRMR.classic(data=data_chunk, target_indices=ncol(df_chunk), 
+                       feature_count=min(50, length(chunk)))
+    selected_feats <- c(selected_feats, chunk[solutions(res)[[1]]])
+  }
+  
+  # Final selection of top 500 features
+  selected_feats <- unique(selected_feats)
+  if(length(selected_feats) > 500) {
+    df_final <- data.frame(x_train[, selected_feats, drop=FALSE], target=as.numeric(y_train))
+    data_final <- mRMR.data(data=df_final)
+    res_final <- mRMR.classic(data=data_final, target_indices=ncol(df_final), 
+                             feature_count=min(500, length(selected_feats)))
+    final_feats <- selected_feats[solutions(res_final)[[1]]]
+  } else {
+    final_feats <- selected_feats
+  }
+  
+  mrmr_results[[nm]] <- final_feats
+  cat("Selected", length(final_feats), "features for", nm, "\n")
+}
+```
+
+## 4) Hybrid Feature Selection Methods
+
+```{r hybrid-selection}
+hybrid_results <- list()
+
+for (nm in names(preprocessed_data)) {
+  cat("\n=== Hybrid Feature Selection for:", nm, "===\n")
+  
+  x_train <- preprocessed_data[[nm]]$x_train[, mrmr_results[[nm]], drop=FALSE]
+  y_train <- preprocessed_data[[nm]]$y_train
+  x_test <- preprocessed_data[[nm]]$x_test[, mrmr_results[[nm]], drop=FALSE]
+  y_test <- preprocessed_data[[nm]]$y_test
+  
+  # 1) mRMR + sPLS
+  ncomp <- min(5, ncol(x_train))
+  keepX <- rep(min(50, floor(ncol(x_train)/ncomp)), ncomp)
+  spls_model <- mixOmics::splsda(x_train, y_train, ncomp=ncomp, keepX=keepX)
+  spls_features <- unique(unlist(apply(spls_model$loadings$X, 2, 
+                                      function(x) names(x)[abs(x) > 0])))
+  
+  # 2) mRMR + RFE
+  ctrl <- rfeControl(functions=rfFuncs, method="cv", number=5)
+  rfe_model <- rfe(x=x_train, y=y_train, sizes=c(20, 50, 100), rfeControl=ctrl)
+  rfe_features <- predictors(rfe_model)
+  
+  # 3) mRMR + LASSO
+  cv_lasso <- cv.glmnet(as.matrix(x_train), y_train, family="binomial", alpha=1)
+  coef_lasso <- coef(cv_lasso, s="lambda.min")
+  lasso_features <- rownames(coef_lasso)[coef_lasso[,1] != 0]
+  lasso_features <- lasso_features[lasso_features != "(Intercept)"]
+  
+  hybrid_results[[nm]] <- list(
+    sPLS = spls_features,
+    RFE = rfe_features,
+    LASSO = lasso_features
+  )
+  
+  cat("Features selected by each method:\n")
+  cat("  sPLS:", length(spls_features), "\n")
+  cat("  RFE:", length(rfe_features), "\n")
+  cat("  LASSO:", length(lasso_features), "\n")
+}
+```
+
+## 5) Classification with Logistic Regression
+
+```{r classification}
+performance_summary <- data.frame()
+
+for (nm in names(preprocessed_data)) {
+  cat("\n=== Classification for:", nm, "===\n")
+  
+  x_train_full <- preprocessed_data[[nm]]$x_train[, mrmr_results[[nm]], drop=FALSE]
+  x_test_full <- preprocessed_data[[nm]]$x_test[, mrmr_results[[nm]], drop=FALSE]
+  y_train <- preprocessed_data[[nm]]$y_train
+  y_test <- preprocessed_data[[nm]]$y_test
+  
+  for (method in c("sPLS", "RFE", "LASSO")) {
+    features <- hybrid_results[[nm]][[method]]
+    
+    if(length(features) < 2) {
+      cat("Skipping", method, "- not enough features\n")
+      next
+    }
+    
+    # Select features for current method
+    x_train_sub <- x_train_full[, features, drop=FALSE]
+    x_test_sub <- x_test_full[, features, drop=FALSE]
+    
+    # Train logistic regression
+    train_df <- data.frame(x_train_sub, Class = y_train)
+    logit_model <- glm(Class ~ ., data = train_df, family = "binomial")
+    
+    # Predict
+    test_df <- data.frame(x_test_sub)
+    pred_prob <- predict(logit_model, newdata = test_df, type = "response")
+    pred_class <- factor(ifelse(pred_prob > 0.5, "Tumor", "Normal"), 
+                        levels = c("Normal", "Tumor"))
+    
+    # Calculate metrics
+    cm <- confusionMatrix(pred_class, y_test, positive = "Tumor")
+    
+    # Calculate ROC curve - use correct pROC syntax
+    roc_obj <- pROC::roc(y_test, pred_prob)
+    
+    # Store results
+    performance_summary <- rbind(performance_summary, data.frame(
+      Dataset = nm,
+      Method = method,
+      Accuracy = round(cm$overall["Accuracy"], 3),
+      Recall = round(cm$byClass["Sensitivity"], 3),
+      Specificity = round(cm$byClass["Specificity"], 3),
+      F1 = round(2 * (cm$byClass["Precision"] * cm$byClass["Sensitivity"]) / 
+                 (cm$byClass["Precision"] + cm$byClass["Sensitivity"]), 3),
+      AUC = round(pROC::auc(roc_obj), 3),
+      Num_Features = length(features)
+    ))
+  }
+}
+
+print(performance_summary)
+```
+
+
+## 6) Visualizations
+
+```{r visualizations}
+# Variance vs Rank Scatterplot (Faceted)
+all_df <- data.frame()
+
+for (nm in names(mrmr_results)) {
+  top_feats <- mrmr_results[[nm]]
+  x_train <- preprocessed_data[[nm]]$x_train
+  feat_vars <- apply(x_train, 2, var)
+  
+  valid_feats <- intersect(top_feats, names(feat_vars))
+  
+  df_tmp <- data.frame(
+    Dataset = nm,
+    Feature = valid_feats,
+    Rank = seq_along(valid_feats),
+    Variance = feat_vars[valid_feats]
+  )
+  
+  all_df <- rbind(all_df, df_tmp)
+}
+
+# Faceted plots
+p_faceted <- ggplot(all_df, aes(x = Rank, y = Variance)) +
+  geom_point(color = "darkred", alpha = 0.5, size = 1.2) +
+  geom_line(color = "steelblue", alpha = 0.7) +
+  facet_wrap(~ Dataset, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Variance vs Rank for mRMR-Selected Features",
+       x = "Rank", y = "Variance")
+print(p_faceted)
+
+# Overlay plot
+p_overlay <- ggplot(all_df, aes(x = Rank, y = Variance, color = Dataset)) +
+  geom_point(alpha = 0.4, size = 1.1) +
+  geom_line(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Variance vs Rank Comparison Across Datasets",
+       x = "Rank", y = "Variance") +
+  theme(legend.position = "top")
+print(p_overlay)
+
+
+```
+
+
+## 7) Method Consistency Across Datasets
+
+```{r method-consistency}
+# Calculate consistency scores
+consistency_data <- performance_summary %>%
+  group_by(Method) %>%
+  summarise(
+    Mean_AUC = mean(AUC),
+    SD_AUC = sd(AUC),
+    Min_AUC = min(AUC),
+    Max_AUC = max(AUC),
+    Consistency_Score = 1 - (SD_AUC / Mean_AUC)
+  ) %>%
+  arrange(desc(Mean_AUC))
+
+# Plot consistency
+ggplot(consistency_data, aes(x = reorder(Method, Mean_AUC), y = Mean_AUC, fill = Method)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = Mean_AUC - SD_AUC, ymax = Mean_AUC + SD_AUC), 
+                width = 0.2, color = "black") +
+  scale_fill_manual(values = c("#FF6B6B", "#4ECDC4", "#45B7D1")) + # Removed one color
+  theme_minimal() +
+  labs(title = "Method Consistency Across Datasets",
+       x = "Method", y = "Mean AUC ± SD",
+       caption = "Error bars represent standard deviation across datasets") +
+  coord_flip() +
+  geom_text(aes(label = paste0("Consistency: ", round(Consistency_Score, 3))), 
+            hjust = -0.1, size = 3)
+```
+
+## 8) Final Summary Table
+
+```{r final-summary}
+# Load kableExtra for nice table formatting
+library(kableExtra)
+
+final_summary <- performance_summary %>%
+  group_by(Method) %>%
+  summarise(
+    Avg_Accuracy = mean(Accuracy),
+    Avg_Recall = mean(Recall),
+    Avg_Specificity = mean(Specificity),
+    Avg_F1 = mean(F1),
+    Avg_AUC = mean(AUC),
+    Avg_Features = mean(Num_Features),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Avg_AUC))
+
+kable(final_summary, caption = "Overall Performance Summary Across All Datasets") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = TRUE, color = "white", background = "#388E3C") %>%
+  column_spec(1, bold = TRUE)
+```
+
+
+#9 Ranking
+
+```{r method a -ranking}
+# Calculate rankings with performance categories
+ranking_data <- performance_summary %>%
+  group_by(Dataset) %>%
+  mutate(
+    Rank = rank(-AUC, ties.method = "min"),
+    Performance = case_when(
+      Rank == 1 ~ "Best",
+      Rank == 2 ~ "Better",
+      Rank == 3 ~ "Good"
+    )
+  ) %>%
+  ungroup() %>%
+  dplyr::select(Dataset, Method, Performance, AUC)
+
+# Create ranking table with performance categories - using spread() as alternative to pivot_wider()
+ranking_table <- ranking_data %>%
+  tidyr::pivot_wider(
+    names_from = Dataset, 
+    values_from = c(Performance, AUC),
+    names_glue = "{Dataset}_{.value}"
+  ) %>%
+  mutate(
+    Avg_AUC = rowMeans(dplyr::select(., contains("AUC")), na.rm = TRUE),
+    Best_Count = rowSums(dplyr::select(., contains("Performance")) == "Best", na.rm = TRUE),
+    Better_Count = rowSums(dplyr::select(., contains("Performance")) == "Better", na.rm = TRUE),
+    Good_Count = rowSums(dplyr::select(., contains("Performance")) == "Good", na.rm = TRUE)
+  ) %>%
+  arrange(desc(Avg_AUC))
+
+# Rename columns for better readability
+colnames(ranking_table) <- gsub("_Performance", "_Perf", colnames(ranking_table))
+colnames(ranking_table) <- gsub("_AUC", "", colnames(ranking_table))
+
+# Create formatted table
+kable(ranking_table, caption = "Method Performance by Dataset (Good < Better < Best)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(1, bold = TRUE, color = "white", background = "#388E3C") %>%
+  column_spec(1, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "Lung" = 2, "Breast" = 2, "Liver" = 2, "Gastric" = 2, "Summary" = 4))
+```
+
+
+#10  Radar Chart for Multi-Metric Comparison
+```{r radar-chart}
+# Define colors for the three methods
+method_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1")  # sPLS, RFE, LASSO
+
+create_radar_data <- function(performance_df) {
+  radar_data <- performance_df %>%
+    dplyr::select(Dataset, Method, Accuracy, Recall, Specificity, F1, AUC) %>%
+    reshape2::melt(id.vars = c("Dataset", "Method")) %>%
+    group_by(Dataset, variable) %>%
+    mutate(value_scaled = (value - min(value)) / (max(value) - min(value))) %>%
+    ungroup()
+  return(radar_data)
+}
+
+radar_data <- create_radar_data(performance_summary)
+
+radar_plots <- list()
+for(dataset in unique(performance_summary$Dataset)) {
+  plot_data <- radar_data %>% filter(Dataset == dataset)
+  
+  p <- ggplot(plot_data, aes(x = variable, y = value_scaled, group = Method, color = Method)) +
+    geom_point(size = 3) +
+    geom_line(size = 1.2) +
+    geom_polygon(aes(fill = Method), alpha = 0.1, size = 1) +
+    scale_color_manual(values = method_colors) +
+    scale_fill_manual(values = method_colors) +
+    coord_polar() +
+    theme_minimal() +
+    labs(title = paste("Performance Radar -", dataset),
+         x = "", y = "Scaled Performance") +
+    theme(legend.position = "right",
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank())
+  
+  radar_plots[[dataset]] <- p
+}
+
+# Arrange radar plots in grid
+gridExtra::grid.arrange(grobs = radar_plots, ncol = 2)
+```
+
+
+#11 Boxplots of Performance Metrics
+```{r boxplots}
+boxplot_data <- performance_summary %>%
+  dplyr::select(Dataset, Method, dplyr::everything()) %>%
+  reshape2::melt(id.vars = c("Dataset", "Method"))
+
+ggplot(boxplot_data, aes(x = Method, y = value, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_point(position = position_jitter(width = 0.2), alpha = 0.6) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_fill_manual(values = method_colors) +
+  theme_minimal() +
+  labs(title = "Distribution of Performance Metrics by Method",
+       y = "Metric Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+# 13 Performance Comparison Heatmap
+```{r performance-heatmap}
+create_performance_heatmap <- function(summary_table) {
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(RColorBrewer)
+  
+  # Reshape to long format
+  heatmap_data <- summary_table %>%
+    dplyr::select(Dataset, Method, dplyr::where(is.numeric)) %>%
+    tidyr::pivot_longer(
+      cols = -c(Dataset, Method),
+      names_to = "Metric",
+      values_to = "Value"
+    )
+  
+  # Normalize Value per Metric
+  heatmap_data <- heatmap_data %>%
+    group_by(Metric) %>%
+    mutate(Normalized = (Value - min(Value, na.rm = TRUE)) /
+                        (max(Value, na.rm = TRUE) - min(Value, na.rm = TRUE))) %>%
+    ungroup()
+  
+  # Plot heatmap using normalized values
+  ggplot(heatmap_data, aes(x = Method, y = paste(Dataset, Metric), fill = Normalized)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Value, 3)), color = "white", size = 3, fontface = "bold") +
+    scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "Blues")) +
+    labs(title = "Performance Comparison: sPLS vs RFE vs LASSO",
+         subtitle = "Across all datasets and metrics (colors normalized per metric)",
+         x = "Method", y = "Dataset & Metric") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Create and display the heatmap
+performance_heatmap <- create_performance_heatmap(performance_summary)
+print(performance_heatmap)
+
+```
+
+
+
+
+#                  ===================================================
+#                      FURTHER CLASSIFICATION using mRMR+LASSO data
+#                  ===================================================
+
+
+#Extract Logistic Regression Results for mRMR+LASSO
+````{r}
+logistic_lasso <- performance_summary %>%
+  filter(Method == "LASSO") %>%
+  dplyr::select(Dataset, Classifier = Method, Accuracy, Recall, Specificity, F1, AUC)
+print(logistic_lasso)
+````
+
+
+
+## Additional Classifiers with mRMR+LASSO Features
+
+````{r Additional Classifiers}
+set.seed(1996)
+library(e1071)   # Naive Bayes
+library(kernlab) # SVM
+library(pROC)
+library(caret)
+
+additional_results <- data.frame()
+
+for (nm in names(preprocessed_data)) {
+  x_train <- preprocessed_data[[nm]]$x_train[, hybrid_results[[nm]][["LASSO"]], drop=FALSE]
+  y_train <- preprocessed_data[[nm]]$y_train
+  x_test  <- preprocessed_data[[nm]]$x_test[, hybrid_results[[nm]][["LASSO"]], drop=FALSE]
+  y_test  <- preprocessed_data[[nm]]$y_test
+  
+  train_df <- data.frame(Class = y_train, x_train)
+  test_df  <- data.frame(x_test)
+  
+  # --------- SVM ---------
+  svm_model <- ksvm(x = as.matrix(x_train), y = y_train, type = "C-svc", kernel = "rbfdot", prob.model = TRUE)
+  svm_probs <- predict(svm_model, as.matrix(x_test), type = "probabilities")[, "Tumor"]
+  svm_pred  <- factor(ifelse(svm_probs > 0.5, "Tumor", "Normal"), levels = c("Normal","Tumor"))
+  
+  svm_roc   <- roc(y_test, svm_probs)
+  
+  additional_results <- rbind(additional_results, data.frame(
+    Dataset = nm,
+    Classifier = "SVM",
+    Accuracy = mean(svm_pred == y_test),
+    Recall = sensitivity(svm_pred, y_test),
+    Specificity = specificity(svm_pred, y_test),
+    F1 = F_meas(svm_pred, y_test),
+    AUC = as.numeric(auc(svm_roc))
+  ))
+  
+  # --------- Naive Bayes ---------
+  nb_model <- naiveBayes(Class ~ ., data = train_df)
+  nb_probs <- predict(nb_model, test_df, type = "raw")[, "Tumor"]
+  nb_pred  <- factor(ifelse(nb_probs > 0.5, "Tumor", "Normal"), levels = c("Normal","Tumor"))
+  
+  nb_roc   <- roc(y_test, nb_probs)
+  
+  additional_results <- rbind(additional_results, data.frame(
+    Dataset = nm,
+    Classifier = "Naive Bayes",
+    Accuracy = mean(nb_pred == y_test),
+    Recall = sensitivity(nb_pred, y_test),
+    Specificity = specificity(nb_pred, y_test),
+    F1 = F_meas(nb_pred, y_test),
+    AUC = as.numeric(auc(nb_roc))
+  ))
+}
+
+````
+#Combining Logistic+SVM+Naive Bayes
+````{r}
+combined_results <- rbind(logistic_lasso, additional_results)
+print(combined_results)
+````
+
+
+````{r Overlay ROC Curves for All Classifiers}
+set.seed(1996)  # ensure reproducibility
+
+library(kernlab)
+library(e1071)
+library(pROC)
+library(ggplot2)
+
+# Initialize a data frame to hold all ROC curves across datasets
+roc_combined_df <- data.frame()
+
+for (nm in names(preprocessed_data)) {
+  df_list <- list()
+  
+  # Subset training/testing for top LASSO features
+  x_train <- preprocessed_data[[nm]]$x_train[, hybrid_results[[nm]][["LASSO"]], drop=FALSE]
+  y_train <- preprocessed_data[[nm]]$y_train
+  x_test  <- preprocessed_data[[nm]]$x_test[, hybrid_results[[nm]][["LASSO"]], drop=FALSE]
+  y_test  <- preprocessed_data[[nm]]$y_test
+  
+  # Logistic Regression
+  log_model <- suppressWarnings(
+    glm(Class ~ ., data = data.frame(Class = y_train, x_train), family = "binomial")
+  )
+  log_prob <- predict(log_model, newdata = data.frame(x_test), type = "response")
+  df_list[["Logistic"]] <- data.frame(
+    Dataset = nm,
+    Specificity = 1 - roc(y_test, log_prob, quiet=TRUE)$specificities,
+    Sensitivity = roc(y_test, log_prob, quiet=TRUE)$sensitivities,
+    Classifier = "Logistic"
+  )
+  
+  # SVM
+  svm_model <- ksvm(as.matrix(x_train), y_train, type = "C-svc", kernel = "rbfdot", prob.model = TRUE)
+  svm_prob <- predict(svm_model, as.matrix(x_test), type = "probabilities")[, "Tumor"]
+  df_list[["SVM"]] <- data.frame(
+    Dataset = nm,
+    Specificity = 1 - roc(y_test, svm_prob, quiet=TRUE)$specificities,
+    Sensitivity = roc(y_test, svm_prob, quiet=TRUE)$sensitivities,
+    Classifier = "SVM"
+  )
+  
+  # Naive Bayes
+  nb_model <- naiveBayes(Class ~ ., data = data.frame(Class = y_train, x_train))
+  nb_prob <- predict(nb_model, data.frame(x_test), type = "raw")[, "Tumor"]
+  df_list[["Naive Bayes"]] <- data.frame(
+    Dataset = nm,
+    Specificity = 1 - roc(y_test, nb_prob, quiet=TRUE)$specificities,
+    Sensitivity = roc(y_test, nb_prob, quiet=TRUE)$sensitivities,
+    Classifier = "Naive Bayes"
+  )
+  
+  # Combine all classifiers for this dataset
+  roc_combined_df <- rbind(roc_combined_df, do.call(rbind, df_list))
+}
+
+# Faceted ROC Plot
+ggplot(roc_combined_df, aes(x = Specificity, y = Sensitivity, color = Classifier)) +
+  geom_line(size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  facet_wrap(~ Dataset) +
+  theme_minimal() +
+  labs(title = "ROC Curves by Dataset (Top Features: mRMR+LASSO)",
+       x = "1 - Specificity", y = "Sensitivity") +
+  scale_color_manual(values = c("Logistic" = "#FF6B6B",
+                                "SVM" = "#4ECDC4",
+                                "Naive Bayes" = "#45B7D1")) +
+  theme(legend.position = "top")
+
+````
+````{r}
+# --- Step 1: Combine results (make sure these objects exist first) ---
+combined_results <- rbind(logistic_lasso, additional_results)
+
+# --- Step 2: Summarise AUC with consistent classifier labels ---
+auc_summary <- combined_results %>%
+  mutate(Classifier = case_when(
+    Classifier %in% c("Logistic", "Logistic Regression") ~ "Logistic",
+    TRUE ~ as.character(Classifier)
+  )) %>%
+  group_by(Dataset, Classifier) %>%
+  summarise(
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SE_AUC   = sd(AUC, na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  )
+
+# --- Step 3: Plot Mean AUC ± 95% CI ---
+ggplot(auc_summary, aes(x = Dataset, y = Mean_AUC, color = Classifier, group = Classifier)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), size = 1) +
+  geom_errorbar(
+    aes(ymin = Mean_AUC - 1.96 * SE_AUC, ymax = Mean_AUC + 1.96 * SE_AUC),
+    width = 0.2, position = position_dodge(0.3)
+  ) +
+  scale_color_manual(values = c(
+    "Logistic"     = "#E41A1C",  # red
+    "SVM"          = "#377EB8",  # blue
+    "Naive Bayes"  = "#4DAF4A"   # green
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Mean AUC ± 95% CI by Classifier and Dataset",
+    x = "Dataset", y = "Mean AUC ± 95% CI"
+  ) +
+  theme(legend.position = "top")
+````
+
+
+
+```{r}
+# Ensure Logistic Regression is labeled consistently
+auc_summary <- combined_results %>%
+  mutate(Classifier = case_when(
+    Classifier %in% c("Logistic", "Logistic Regression") ~ "Logistic",
+    TRUE ~ as.character(Classifier)
+  )) %>%
+  group_by(Dataset, Classifier) %>%
+  summarise(
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SE_AUC = sd(AUC, na.rm = TRUE)/sqrt(n()),
+    .groups = "drop"
+  )
+
+# Plot with all three classifiers and distinct colors
+ggplot(auc_summary, aes(x = Dataset, y = Mean_AUC, color = Classifier, group = Classifier)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), size = 1) +
+  geom_errorbar(aes(ymin = Mean_AUC - 1.96*SE_AUC, ymax = Mean_AUC + 1.96*SE_AUC),
+                width = 0.2, position = position_dodge(0.3)) +
+  scale_color_manual(values = c(
+    "Logistic" = "#E41A1C",  # red
+    "SVM" = "#377EB8",       # blue
+    "Naive Bayes" = "#4DAF4A" # green
+  )) +
+  theme_minimal() +
+  labs(title = "Mean AUC ± 95% CI by Classifier and Dataset",
+       x = "Dataset", y = "Mean AUC ± 95% CI") +
+  theme(legend.position = "top")
+
+```
+
+````{r}
+# --- Step 1: Combine results ---
+combined_results <- rbind(logistic_lasso, additional_results)
+
+# --- Step 2: Ensure classifiers are consistently labeled ---
+auc_summary <- combined_results %>%
+  mutate(Classifier = case_when(
+    Classifier %in% c("Logistic", "Logistic Regression") ~ "Logistic",
+    Classifier %in% c("SVM", "Support Vector Machine")   ~ "SVM",
+    Classifier %in% c("Naive", "Naive Bayes")           ~ "Naive Bayes",
+    TRUE ~ as.character(Classifier)
+  )) %>%
+  group_by(Dataset, Classifier) %>%
+  summarise(
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SE_AUC   = sd(AUC, na.rm = TRUE)/sqrt(n()),
+    .groups  = "drop"
+  )
+
+# --- Step 3: Plot with fixed legend & colors ---
+ggplot(auc_summary, aes(x = Dataset, y = Mean_AUC, color = Classifier, group = Classifier)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), size = 1) +
+  geom_errorbar(
+    aes(ymin = Mean_AUC - 1.96 * SE_AUC, ymax = Mean_AUC + 1.96 * SE_AUC),
+    width = 0.2, position = position_dodge(0.3)
+  ) +
+  scale_color_manual(values = c(
+    "Logistic"     = "red",
+    "SVM"          = "blue",
+    "Naive Bayes"  = "green"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Mean AUC ± 95% CI by Classifier and Dataset",
+    x = "Dataset", y = "Mean AUC ± 95% CI"
+  ) +
+  theme(legend.position = "top")
+````
+
+
+````{r rANK method}
+library(dplyr)
+library(kableExtra)
+
+# Check exact classifier names
+unique(combined_results$Classifier)
+
+# Use the exact names from your data
+classifier_summary <- combined_results %>%
+  filter(Classifier %in% c("Logistic Regression", "SVM", "Naive Bayes")) %>%
+  group_by(Classifier) %>%
+  summarise(
+    Avg_Accuracy = mean(Accuracy, na.rm = TRUE),
+    Avg_Recall = mean(Recall, na.rm = TRUE),
+    Avg_Specificity = mean(Specificity, na.rm = TRUE),
+    Avg_F1 = mean(F1, na.rm = TRUE),
+    Avg_AUC = mean(AUC, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Avg_AUC))  # rank by AUC
+
+# Display nicely
+kable(classifier_summary, caption = "Overall Classifier Performance Across All Datasets") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = TRUE, color = "white", background = "#388E3C") %>%
+  column_spec(1, bold = TRUE)
+
+````
+
+
+## 16) Classifier Comparison Visualizations
+
+```{r HEATMAP}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(RColorBrewer)
+set.seed(1996)
+
+# Filter only classifiers we care about
+heatmap_df <- combined_results %>%
+  filter(Classifier %in% c("Logistic", "SVM", "Naive Bayes")) %>%
+  pivot_longer(cols = c(Accuracy, F1, Specificity, Recall, AUC),
+               names_to = "Metric", values_to = "Value") %>%
+  group_by(Metric) %>%
+  mutate(Norm_Value = (Value - min(Value))/(max(Value) - min(Value))) %>%
+  ungroup()
+
+# Plot heatmap with shades of blue
+ggplot(heatmap_df, aes(x = Classifier, y = paste(Dataset, Metric), fill = Norm_Value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Value, 2)), color = "black", size = 3) +
+  scale_fill_gradientn(colors = brewer.pal(9, "Blues")) +  # same blue palette
+  theme_minimal() +
+  labs(title = "Classifier Performance Heatmap Across Datasets & Metrics",
+       x = "Classifier", y = "Dataset & Metric")
+
+```
+
+## 17) Classifier Performance Heatmap
+
+
+
+
+#                         =======================================
+#                           SHAP Analysis for SVM Interpretation
+#                         =======================================
+
+
+## 18) SHAP Analysis for SVM Interpretation - Faceted Version
+
+```{r shap-analysis-faceted}
+# Load required libraries
+library(SHAPforxgboost)
+library(iml)
+library(fastshap)
+library(patchwork)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Function to compute SHAP values
+compute_shap_values <- function(dataset_name) {
+  cat("\n=== Computing SHAP values for", dataset_name, "===\n")
+  
+  # Get mRMR+LASSO features
+  lasso_features <- hybrid_results[[dataset_name]]$LASSO
+  
+  # Prepare data
+  x_train_full <- preprocessed_data[[dataset_name]]$x_train[, mrmr_results[[dataset_name]], drop=FALSE]
+  x_test_full <- preprocessed_data[[dataset_name]]$x_test[, mrmr_results[[dataset_name]], drop=FALSE]
+  x_train_lasso <- x_train_full[, lasso_features, drop=FALSE]
+  x_test_lasso <- x_test_full[, lasso_features, drop=FALSE]
+  y_train <- preprocessed_data[[dataset_name]]$y_train
+  y_test <- preprocessed_data[[dataset_name]]$y_test
+  
+  # Retrain SVM
+  svm_model <- e1071::svm(x = x_train_lasso, y = y_train, 
+                         kernel = "linear", 
+                         probability = TRUE,
+                         scale = TRUE)
+  
+  # Prediction function for SHAP
+  predict_function <- function(model, newdata) {
+    predictions <- predict(model, newdata, probability = TRUE)
+    return(attr(predictions, "probabilities")[, "Tumor"])
+  }
+  
+  # Compute SHAP values
+  shap_values <- fastshap::explain(
+    svm_model,
+    X = as.data.frame(x_test_lasso),
+    pred_wrapper = predict_function,
+    nsim = 100
+  )
+  
+  return(list(
+    shap_matrix = as.matrix(shap_values),
+    feature_values = x_test_lasso,
+    dataset_name = dataset_name
+  ))
+}
+
+# Compute SHAP for all datasets
+shap_results <- lapply(names(preprocessed_data), compute_shap_values)
+names(shap_results) <- names(preprocessed_data)
+
+# 1. FACETED: Feature Importance Plots (Mean |SHAP|)
+importance_data <- purrr::map_dfr(shap_results, function(result) {
+  mean_abs_shap <- colMeans(abs(result$shap_matrix))
+  data.frame(
+    Dataset = result$dataset_name,
+    Feature = names(mean_abs_shap),
+    Mean_ABS_SHAP = mean_abs_shap
+  ) %>%
+    group_by(Dataset) %>%
+    arrange(desc(Mean_ABS_SHAP)) %>%
+    mutate(Rank = row_number()) %>%
+    ungroup()
+}, .id = "Dataset")
+
+# Top 10 features per dataset for plotting
+top_importance <- importance_data %>%
+  group_by(Dataset) %>%
+  filter(Rank <= 10) %>%
+  ungroup()
+
+p_importance <- ggplot(top_importance, aes(x = reorder(Feature, Mean_ABS_SHAP), y = Mean_ABS_SHAP)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  facet_wrap(~ Dataset, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Top 10 Most Important Features by Dataset",
+       x = "Feature", y = "Mean |SHAP value|",
+       subtitle = "Features with largest impact on SVM predictions") +
+  theme(axis.text.y = element_text(size = 8))
+
+print(p_importance)
+
+# 2. FACETED: SHAP Summary Plots (Beeswarm plots)
+shap_long_data <- purrr::map_dfr(shap_results, function(result) {
+  shap_df <- as.data.frame(result$shap_matrix)
+  feature_df <- as.data.frame(result$feature_values)
+  
+  shap_long <- shap_df %>%
+    mutate(Observation = row_number()) %>%
+    pivot_longer(cols = -Observation, names_to = "Feature", values_to = "SHAP")
+  
+  feature_long <- feature_df %>%
+    mutate(Observation = row_number()) %>%
+    pivot_longer(cols = -Observation, names_to = "Feature", values_to = "Feature_Value")
+  
+  left_join(shap_long, feature_long, by = c("Observation", "Feature")) %>%
+    mutate(Dataset = result$dataset_name)
+}, .id = "Dataset")
+
+# Get top 5 features per dataset for beeswarm plots
+top_features_per_dataset <- importance_data %>%
+  group_by(Dataset) %>%
+  filter(Rank <= 5) %>%
+  pull(Feature)
+
+shap_top <- shap_long_data %>%
+  filter(Feature %in% top_features_per_dataset)
+
+p_beeswarm <- ggplot(shap_top, aes(x = SHAP, y = Feature, color = Feature_Value)) +
+  geom_point(alpha = 0.6, size = 1) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = median(shap_top$Feature_Value, na.rm = TRUE),
+                       name = "Feature Value") +
+  facet_wrap(~ Dataset, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "SHAP Value Distribution - Top 5 Features per Dataset",
+       x = "SHAP Value (Impact on Prediction)",
+       y = "Feature",
+       subtitle = "Red = high feature value, Blue = low feature value") +
+  theme(axis.text.y = element_text(size = 8))
+
+print(p_beeswarm)
+
+# 3. FACETED: Dependence Plots for top 3 features per dataset
+dependence_data <- shap_long_data %>%
+  inner_join(importance_data %>% filter(Rank <= 3), 
+            by = c("Dataset", "Feature"))
+
+p_dependence <- ggplot(dependence_data, aes(x = Feature_Value, y = SHAP)) +
+  geom_point(alpha = 0.4, color = "steelblue", size = 1) +
+  geom_smooth(method = "loess", color = "red", se = FALSE, size = 0.8) +
+  facet_grid(Feature ~ Dataset, scales = "free") +
+  theme_minimal() +
+  labs(title = "SHAP Dependence Plots - Top 3 Features per Dataset",
+       x = "Feature Value",
+       y = "SHAP Value (Impact on Prediction)",
+       subtitle = "Relationship between feature values and their impact on predictions") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        strip.text = element_text(size = 8))
+
+print(p_dependence)
+
+# 4. FACETED: Cross-dataset Consensus Heatmap
+consensus_heatmap_data <- importance_data %>%
+  filter(Rank <= 15) %>%  # Top 15 genes from each dataset
+  mutate(Importance_Score = 1/Rank)  # Convert rank to score (lower rank = higher score)
+
+p_consensus <- ggplot(consensus_heatmap_data, 
+                     aes(x = Dataset, y = reorder(Feature, Mean_ABS_SHAP), fill = Importance_Score)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Rank), color = "white", size = 3, fontface = "bold") +
+  scale_fill_gradient(low = "#FEE08B", high = "#D73027", 
+                      name = "Importance\nScore") +
+  theme_minimal() +
+  labs(title = "Top Gene Importance Across All Datasets",
+       subtitle = "Ranking of most important genes (Lower number = More Important)",
+       x = "Dataset", y = "Gene") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 8))
+
+print(p_consensus)
+
+# 5. FACETED: Overall Importance Distribution
+p_distribution <- ggplot(importance_data %>% filter(Rank <= 20), 
+                        aes(x = as.factor(Rank), y = Mean_ABS_SHAP, fill = Dataset)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ Dataset, ncol = 2) +
+  scale_fill_manual(values = c("#FF6B6B", "#4ECDC4", "#45B7D1", "#F9A602")) +
+  theme_minimal() +
+  labs(title = "Distribution of SHAP Importance by Rank",
+       x = "Rank", y = "Mean |SHAP value|",
+       subtitle = "How importance scores distribute across different rank positions") +
+  theme(legend.position = "none")
+
+print(p_distribution)
+
+# Save all plots in a list for easy access
+shap_plots <- list(
+  importance = p_importance,
+  beeswarm = p_beeswarm,
+  dependence = p_dependence,
+  consensus = p_consensus,
+  distribution = p_distribution
+)
+
+# Save important genes summary
+important_genes_summary <- importance_data %>%
+  group_by(Feature) %>%
+  summarise(
+    Average_Rank = mean(Rank),
+    Min_Rank = min(Rank),
+    Max_Rank = max(Rank),
+    Datasets_Appeared = n_distinct(Dataset),
+    Avg_Importance = mean(Mean_ABS_SHAP),
+    .groups = "drop"
+  ) %>%
+  arrange(Average_Rank)
+
+cat("\n=== Final List of Important Genes ===\n")
+print(head(important_genes_summary, 20))
+```
+
+````{r}
+# ----------------- Faceted ROC Plot -----------------
+p1 <- ggplot(roc_combined_df, aes(x = Specificity, y = Sensitivity, color = Classifier)) +
+  geom_line(size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  facet_wrap(~ Dataset) +
+  theme_minimal() +
+  labs(title = "ROC Curves by Dataset (Top Features: mRMR+LASSO)",
+       x = "1 - Specificity", y = "Sensitivity") +
+  scale_color_manual(values = c(
+    "Logistic" = "red",
+    "SVM" = "green",
+    "Naive Bayes" = "blue"
+  )) +
+  theme(legend.position = "top")
+
+# Save faceted ROC plot
+ggsave("faceted_ROC_curves.pdf", plot = p1, device = "pdf", width = 10, height = 7)
+
+
+# ----------------- Mean AUC Plot -----------------
+p2 <- ggplot(auc_summary, aes(x = Dataset, y = Mean_AUC, color = Classifier, group = Classifier)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), size = 1) +
+  geom_errorbar(aes(ymin = Mean_AUC - 1.96*SE_AUC, ymax = Mean_AUC + 1.96*SE_AUC),
+                width = 0.2, position = position_dodge(0.3)) +
+  scale_color_manual(values = c(
+    "Logistic" = "red",
+    "SVM" = "green",
+    "Naive Bayes" = "blue"
+  )) +
+  theme_minimal() +
+  labs(title = "Mean AUC ± 95% CI by Classifier and Dataset",
+       x = "Dataset", y = "Mean AUC ± 95% CI") +
+  theme(legend.position = "top")
+
+# Save Mean AUC plot
+ggsave("mean_AUC_plot.pdf", plot = p2, device = "pdf", width = 10, height = 7)
+````
+
+
+````{r}
+# Remove title and subtitle from the importance plot
+p_importance_clean <- p_importance + labs(title = NULL, subtitle = NULL)
+
+# Save to PDF
+pdf("shap_importance_plot.pdf", width = 10, height = 6)
+print(p_importance_clean)
+dev.off()
+
+````
+
+
