@@ -1135,72 +1135,6 @@ ggplot(boxplot_data, aes(x = Classifier, y = Value, fill = Classifier)) +
 
 ````
 
-````{r}
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-
-# -------------------------
-# 1. Prepare logistic results
-# -------------------------
-logistic_results <- summary_metrics %>%
-  rename(Recall = Sensitivity) %>%
-  select(Dataset, Classifier = Method, Accuracy, Recall, Specificity, F1, AUC) %>%
-  mutate(
-    Accuracy    = as.numeric(Accuracy),
-    Recall      = as.numeric(Recall),
-    Specificity = as.numeric(Specificity),
-    F1          = as.numeric(F1),
-    AUC         = as.numeric(AUC),
-    Precision   = ifelse(is.na(F1) | F1 == 0 | Recall == 0, NA, F1 * (Accuracy / Recall))
-  )
-
-logistic_results$Classifier <- "Logistic"
-
-# -------------------------
-# 2. Combine with additional_results
-# -------------------------
-all_results <- bind_rows(additional_results, logistic_results)
-
-# -------------------------
-# 3. Pivot for ggplot
-# -------------------------
-boxplot_data <- all_results %>%
-  pivot_longer(
-    cols = Accuracy:AUC,
-    names_to = "Metric",
-    values_to = "Value"
-  )
-
-# -------------------------
-# 4. Define colours
-# -------------------------
-method_colors <- c(
-  "Logistic"   = "red",
-  "SVM"        = "green",
-  "NaiveBayes" = "blue"
-)
-
-# -------------------------
-# 5. Create boxplot (no title/subtitle)
-# -------------------------
-boxplot_plot <- ggplot(boxplot_data, aes(x = Classifier, y = Value, fill = Classifier)) +
-  geom_boxplot(alpha = 0.7) +
-  geom_jitter(width = 0.2, alpha = 0.6, color = "black", size = 1.5) +
-  facet_wrap(~ Metric, scales = "free_y") +
-  scale_fill_manual(values = method_colors) +
-  theme_minimal(base_size = 14) +
-  labs(x = "Classifier", y = "Metric Value") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1),
-        legend.position = "none")
-
-# -------------------------
-# 6. Save as PDF
-# -------------------------
-ggsave("Classifier_Boxplots.pdf", plot = boxplot_plot, width = 10, height = 6, units = "in")
-````
-
-
 
 ````{r}
 # ================================================================
@@ -1695,6 +1629,7 @@ print(p_distribution)
 # Save the plot
 ggsave("SHAP_Importance_Distribution.png", p_distribution, width = 10, height = 6, dpi = 300)
 ````
+
 
 
 
