@@ -1,0 +1,1705 @@
+
+---
+title: "Hybrid + Clasification + SHAP VALUES"
+author: "Munyaradzi Ndumeya"
+date: "2025-09-15"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+# OPTIONAL ::: To clear the entire history
+````{r}
+rm(list = ls(all.names = TRUE), .history)
+````
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, results='hold')
+set.seed(1996)
+```
+
+## 0) Libraries
+
+```{r libraries}
+library(GEOquery)
+library(caret)
+library(mRMRe)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(mixOmics)
+library(glmnet)
+library(MASS)
+library(UpSetR)
+library(doParallel)
+library(DMwR)
+
+set.seed(1996)
+```
+
+## 1) Load GEO Datasets
+
+```{r load-datasets}
+options(timeout = 600000)
+load_GEO_dataset <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE)[[1]]
+  expr <- exprs(gse)
+  pheno <- pData(gse)
+  stopifnot(colnames(expr) == rownames(pheno))
+  
+  tissue_col <- grep("tissue|characteristics|source|description",
+                     colnames(pheno), ignore.case=TRUE, value=TRUE)[1]
+  
+  labels <- ifelse(grepl("tumor|cancer|malignant", pheno[, tissue_col], ignore.case=TRUE), "Tumor",
+                   ifelse(grepl("normal|control|healthy", pheno[, tissue_col], ignore.case=TRUE), "Normal", NA))
+  labels <- factor(labels, levels=c("Normal","Tumor"))
+  
+  list(expr=expr, pheno=pheno, labels=labels)
+}
+
+datasets <- list(
+  Lung    = "GSE19804",
+  Breast  = "GSE15852",
+  Liver   = "GSE112790",
+  Gastric = "GSE13911"
+)
+
+loaded_data <- lapply(datasets, load_GEO_dataset)
+```
+
+## 2) PREPROCESSING
+
+```{r split-preprocess}
+library(caret)
+library(DMwR)       # for SMOTE
+library(sva)        # for ComBat
+set.seed(1996)
+
+split_data <- list()
+
+for (nm in names(loaded_data)) {
+  cat("\n=== Processing dataset:", nm, "===\n")
+  
+  # --- Extract features and labels
+  X <- loaded_data[[nm]]$expr
+  y <- loaded_data[[nm]]$labels
+  
+  # --- Train/test split
+  set.seed(1996)
+  train_idx <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[, train_idx, drop = FALSE]
+  X_test  <- X[, -train_idx, drop = FALSE]
+  y_train <- y[train_idx]
+  y_test  <- y[-train_idx]
+  
+  # --- Variance filtering
+  vars <- apply(X_train, 1, var)
+  keep_genes <- vars > quantile(vars, 0.2)
+  X_train <- X_train[keep_genes, , drop = FALSE]
+  X_test  <- X_test[keep_genes, , drop = FALSE]
+  
+  # --- Balancing
+  df_train <- data.frame(t(X_train), Class = y_train)
+  
+  if (nm == "Liver") {
+    set.seed(1996)
+    df_train$Class <- as.factor(df_train$Class)
+    df_bal <- SMOTE(Class ~ ., data = df_train, perc.over = 100, k = 5)
+    
+  } else if (nm == "Gastric") {
+    set.seed(1996)
+    df_bal <- upSample(
+      x = df_train[, -ncol(df_train)],
+      y = df_train$Class,
+      yname = "Class"
+    )
+    
+  } else {
+    df_bal <- df_train
+  }
+  
+  # --- Prepare final train matrices
+  X_train <- t(as.matrix(df_bal[, -ncol(df_bal)]))
+  y_train <- df_bal$Class
+  
+  # --- Batch correction (if batch info exists)
+  pheno_train <- loaded_data[[nm]]$pheno[colnames(X_train), , drop = FALSE]
+  pheno_test  <- loaded_data[[nm]]$pheno[colnames(X_test), , drop = FALSE]
+  
+  if (!is.null(pheno_train$batch) && length(unique(pheno_train$batch)) > 1) {
+    mod_train <- model.matrix(~1, pheno_train)
+    X_train <- ComBat(
+      dat = X_train,
+      batch = pheno_train$batch,
+      mod = mod_train,
+      par.prior = TRUE,
+      prior.plots = FALSE
+    )
+    
+    if (!is.null(pheno_test$batch)) {
+      X_test <- ComBat(
+        dat = X_test,
+        batch = pheno_test$batch,
+        mod = mod_train,
+        par.prior = TRUE,
+        prior.plots = FALSE,
+        ref.batch = pheno_train$batch[1]
+      )
+    }
+  }
+  
+  # --- Store processed data
+  split_data[[nm]] <- list(
+    train_expr   = X_train,
+    test_expr    = X_test,
+    train_labels = y_train,
+    test_labels  = y_test
+  )
+  
+  cat("Finished processing", nm, "\n")
+}
+```
+
+## 3) mRMR Feature Selection
+
+```{r mrmr-selection}
+## -----------------------------
+## Clean mRMR prefilter function
+## -----------------------------
+library(mRMRe)
+library(caret)
+
+mrmr_prefilter <- function(X_train, y_train,
+                           top_features_per_chunk = 100,
+                           final_num_features = 1000,
+                           chunk_size = 5000,
+                           target_limit = 46340,
+                           cv_folds = 5,
+                           seed = 1996) {
+  
+  set.seed(seed)
+  options(mRMRe.seed = seed)
+  # --- Step 1: Variance filtering to reduce extreme dimensions for mRMR to run without returning error
+  feature_vars <- apply(X_train, 2, var)
+  selected <- names(feature_vars)
+  quantiles <- seq(0, 1, by = 0.02)
+  for (q in quantiles) {
+    cutoff <- quantile(feature_vars, probs = q)
+    sel <- names(feature_vars)[feature_vars >= cutoff]
+    if (length(sel) <= target_limit) {
+      selected <- sel
+      break
+    }
+  }
+
+  # --- Step 2: Split features into chunks
+  feature_chunks <- split(selected, ceiling(seq_along(selected) / chunk_size))
+  
+  # --- Step 3: CV folds
+  folds <- createFolds(y_train, k = cv_folds, list = TRUE, returnTrain = TRUE)
+  fold_features <- vector("list", length(folds))
+  
+  for (i in seq_along(folds)) {
+    cat("Processing mRMR Fold:", i, "\n")
+    
+    tr_idx <- folds[[i]]
+    te_idx <- setdiff(seq_along(y_train), tr_idx)
+    
+    Xtr <- X_train[tr_idx, selected, drop = FALSE]
+    ytr <- y_train[tr_idx]
+    
+    sel_from_chunks <- c()
+    
+    for (chunk in feature_chunks) {
+      feats <- intersect(chunk, colnames(Xtr))
+      if (length(feats) < 2) next
+      
+      dfc <- as.data.frame(Xtr[, feats, drop = FALSE])
+      dfc$target <- as.numeric(ytr)
+      
+      dm <- tryCatch(mRMRe::mRMR.data(data = dfc), error = function(e) NULL)
+      if (is.null(dm)) next
+      
+      res <- tryCatch(
+        mRMRe::mRMR.classic(data = dm,
+                            target_indices = ncol(dfc),
+                            feature_count = min(top_features_per_chunk, length(feats))),
+        error = function(e) NULL
+      )
+      if (is.null(res)) next
+      
+      idx <- mRMRe::solutions(res)[[1]]
+      sel_from_chunks <- c(sel_from_chunks, mRMRe::featureNames(dm)[idx])
+    }
+    
+    # --- Fallback if too few features
+    if (length(sel_from_chunks) < 2) {
+      warning(paste("Fold", i, ": too few features, fallback to variance-selected"))
+      sel_from_chunks <- selected
+    }
+    
+    # --- Aggregate features across chunks
+    df_agg <- as.data.frame(Xtr[, sel_from_chunks, drop = FALSE])
+    df_agg$target <- as.numeric(ytr)
+    
+    dm2 <- mRMRe::mRMR.data(data = df_agg)
+    final_k <- min(final_num_features, length(sel_from_chunks))
+    
+    res2 <- mRMRe::mRMR.classic(data = dm2, target_indices = ncol(df_agg), feature_count = final_k)
+    fidx <- mRMRe::solutions(res2)[[1]]
+    final_feats <- mRMRe::featureNames(dm2)[fidx]
+    
+    fold_features[[i]] <- final_feats
+  }
+  
+  # --- Step 4: Aggregate across folds (features selected in majority of folds)
+  all_feats <- unlist(fold_features)
+  feat_tab <- table(all_feats)
+  final_selected <- names(feat_tab[feat_tab >= ceiling(cv_folds / 2)]) # majority vote
+  
+  return(final_selected)
+}
+
+## -----------------------------
+## Apply mRMR prefilter to all datasets
+## -----------------------------
+mRMR_results <- list()
+for (nm in names(split_data)) {
+  cat("\n=== Running mRMR prefilter for dataset:", nm, "===\n")
+  Xtr <- t(split_data[[nm]]$train_expr) # mRMRe expects samples as rows
+  ytr <- split_data[[nm]]$train_labels
+  mRMR_results[[nm]] <- mrmr_prefilter(Xtr, ytr,
+                                        top_features_per_chunk = 100,
+                                        final_num_features = 1000,
+                                        chunk_size = 5000,
+                                        cv_folds = 5)
+  cat("Selected features:", length(mRMR_results[[nm]]), "\n")
+}
+```
+
+
+```{r}
+# Number of features selected by mRMR
+length(mRMR_results$Lung)
+
+# Number of features in the processed train_expr
+length(rownames(split_data$Lung$train_expr))
+
+# How many mRMR features are actually present
+sum(mRMR_results$Lung %in% rownames(split_data$Lung$train_expr))
+
+# Which ones are missing
+setdiff(mRMR_results$Lung, rownames(split_data$Lung$train_expr))
+
+```
+
+## 4) Hybrid Feature Selection Methods
+
+````{r}
+library(caret)
+library(mixOmics)
+library(glmnet)
+
+# -----------------------------
+# Function: Run Hybrid Method Safely
+# -----------------------------
+run_hybrid_selection <- function(x_train, y_train, method, ncomp = 5, keepX = 50) {
+  
+  x_train <- as.matrix(x_train)
+  y_train <- factor(y_train)
+  
+  if(ncol(x_train) < 2) {
+    warning(paste("Too few features for method:", method))
+    return(character(0))
+  }
+  
+  switch(method,
+         "sPLS" = {
+           ncomp <- min(ncomp, ncol(x_train)-1)
+           keepX <- rep(min(keepX, floor(ncol(x_train)/ncomp)), ncomp)
+           model <- mixOmics::splsda(x_train, y_train, ncomp = ncomp, keepX = keepX)
+           features <- unique(unlist(apply(model$loadings$X, 2, 
+                                           function(x) names(x)[abs(x) > 1e-6])))
+         },
+         "RFE" = {
+           ctrl <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+           sizes <- c(20,50,100)
+           sizes <- sizes[sizes <= ncol(x_train)]
+           if(length(sizes) == 0) sizes <- min(10, ncol(x_train))
+           model <- rfe(x_train, y_train, sizes = sizes, rfeControl = ctrl)
+           features <- predictors(model)
+         },
+         "LASSO" = {
+           cv_model <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1)
+           coefs <- coef(cv_model, s = "lambda.min")
+           features <- rownames(coefs)[as.vector(coefs != 0)]
+           features <- setdiff(features, "(Intercept)")
+         })
+  
+  return(features)
+}
+
+# -----------------------------
+# Hybrid Feature Selection Across All Datasets
+# -----------------------------
+methods <- c("sPLS", "RFE", "LASSO")
+hybrid_results <- list(sPLS = list(), RFE = list(), LASSO = list())
+
+for(nm in names(split_data)) {
+  cat("\n=== Processing dataset:", nm, "===\n")
+  
+  # Ensure feature names are consistent
+  rownames(split_data[[nm]]$train_expr) <- make.names(rownames(split_data[[nm]]$train_expr))
+  rownames(split_data[[nm]]$test_expr)  <- make.names(rownames(split_data[[nm]]$test_expr))
+  
+  # Find common mRMR-selected features present in both train and test
+  valid_feats <- intersect(mRMR_results[[nm]], rownames(split_data[[nm]]$train_expr))
+  common_feats <- intersect(valid_feats, rownames(split_data[[nm]]$test_expr))
+  
+  if(length(common_feats) < 2) {
+    warning("Too few common features for dataset:", nm)
+    next
+  }
+  
+  # Subset and transpose: samples x features
+  x_train <- t(split_data[[nm]]$train_expr[common_feats, , drop = FALSE])
+  x_test  <- t(split_data[[nm]]$test_expr[common_feats, , drop = FALSE])
+  y_train <- split_data[[nm]]$train_labels
+  y_test  <- split_data[[nm]]$test_labels
+  
+  cat("Number of features used:", ncol(x_train), "\n")
+  
+  # Run each hybrid method
+  for(method in methods) {
+    features <- run_hybrid_selection(x_train, y_train, method)
+    hybrid_results[[method]][[nm]] <- features
+    cat(method, "selected features:", length(features), "\n")
+  }
+}
+
+# Save results
+saveRDS(hybrid_results, "mRMR_hybrid_results.rds")
+````
+
+
+
+````{r}
+# Load the saved hybrid results
+hybrid_res <- readRDS("mRMR_hybrid_results.rds")
+
+# Function to summarize feature sets for each dataset and method
+summarize_features <- function(hybrid_list) {
+  for (method in names(hybrid_list)) {
+    cat("\n=== Method:", method, "===\n")
+    for (dataset in names(hybrid_list[[method]])) {
+      features <- hybrid_list[[method]][[dataset]]
+      cat("Dataset:", dataset, 
+          "| Selected features:", length(features), "\n")
+      if(length(features) > 0) {
+        cat("First 10 features:", paste(features[1:min(10, length(features))], collapse = ", "), "\n")
+      } else {
+        cat("No features selected!\n")
+      }
+    }
+  }
+}
+
+# Run the summary
+summarize_features(hybrid_res)
+
+````
+## (5) Classification with Logistic Regression
+
+
+#Rest of the Methods
+````{r}
+library(caret)
+library(glmnet)
+library(pROC)
+
+# -----------------------------
+# Function to train logistic regression and evaluate
+# -----------------------------
+train_logistic <- function(dataset_name, split_data, feature_list, method_name) {
+  
+  features <- feature_list[[method_name]][[dataset_name]]
+  if(length(features) < 2){
+    warning("Too few features for logistic regression in ", dataset_name, " with ", method_name)
+    return(NULL)
+  }
+  
+  # Subset train/test
+  x_train <- t(split_data[[dataset_name]]$train_expr[features, , drop = FALSE])
+  x_test  <- t(split_data[[dataset_name]]$test_expr[features, , drop = FALSE])
+  y_train <- split_data[[dataset_name]]$train_labels
+  y_test  <- split_data[[dataset_name]]$test_labels
+  
+  # Train logistic regression (ridge)
+  log_model <- cv.glmnet(as.matrix(x_train), y_train, family="binomial", alpha=0)
+  
+  # Predict probabilities
+  prob_train <- predict(log_model, newx=as.matrix(x_train), s="lambda.min", type="response")
+  prob_test  <- predict(log_model, newx=as.matrix(x_test), s="lambda.min", type="response")
+  
+  # Predict classes
+  pred_train <- factor(ifelse(prob_train > 0.5, "Tumor", "Normal"), levels=c("Normal","Tumor"))
+  pred_test  <- factor(ifelse(prob_test > 0.5, "Tumor", "Normal"), levels=c("Normal","Tumor"))
+  
+  # Confusion matrices
+  cm_train <- confusionMatrix(pred_train, y_train)
+  cm_test  <- confusionMatrix(pred_test, y_test)
+  
+  # AUC
+  auc_train <- roc(response = y_train, predictor = as.numeric(prob_train))$auc
+  auc_test  <- roc(response = y_test, predictor = as.numeric(prob_test))$auc
+  
+  list(
+    model = log_model,
+    cm_train = cm_train,
+    cm_test = cm_test,
+    auc_train = auc_train,
+    auc_test = auc_test,
+    prob_train = prob_train,
+    prob_test = prob_test
+  )
+}
+
+# -----------------------------
+# Loop over all datasets and methods
+# -----------------------------
+methods <- c("sPLS","RFE","LASSO")
+results_all <- list()
+
+for(dataset in names(split_data)){
+  cat("\n=== Dataset:", dataset, "===\n")
+  results_all[[dataset]] <- list()
+  for(method in methods){
+    cat("Training logistic regression using", method, "features...\n")
+    res <- train_logistic(dataset, split_data, hybrid_res, method)
+    results_all[[dataset]][[method]] <- res
+  }
+}
+
+# -----------------------------
+# Example: Check Lung sPLS results
+# -----------------------------
+results_all$Lung$sPLS$cm_test
+results_all$Lung$sPLS$auc_test
+
+
+````
+
+
+````{r}
+library(dplyr)
+library(pROC)
+set.seed(1996)
+
+# Ensure metrics function is defined
+calculate_metrics <- function(pred_prob, true_labels) {
+  true_labels <- factor(true_labels, levels = c("Normal", "Tumor"))
+  pred_class <- factor(ifelse(pred_prob > 0.5, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+  cm <- confusionMatrix(pred_class, true_labels, positive = "Tumor")
+  
+  roc_obj <- roc(response = true_labels, predictor = as.numeric(pred_prob), levels = rev(levels(true_labels)))
+  
+  as.data.frame(list(
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    AUC = as.numeric(auc(roc_obj)),
+    Precision = as.numeric(cm$byClass["Pos Pred Value"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    F1 = as.numeric(cm$byClass["F1"])
+  ))
+}
+
+# -----------------------------
+# Create summary table
+# -----------------------------
+summary_metrics <- data.frame()
+methods <- c("sPLS","RFE","LASSO")
+
+for(dataset in names(results_all)){
+  for(method in methods){
+    res <- results_all[[dataset]][[method]]
+    if(is.null(res)) next
+    
+    pred_prob <- res$prob_test
+    true_labels <- split_data[[dataset]]$test_labels
+    
+    metrics <- calculate_metrics(pred_prob, true_labels)
+    metrics$Dataset <- dataset
+    metrics$Method <- method
+    
+    summary_metrics <- rbind(summary_metrics, metrics)
+  }
+}
+
+# Reorder columns
+summary_metrics <- summary_metrics[, c("Dataset","Method","Accuracy","AUC","Precision","Sensitivity","Specificity","F1")]
+
+# Rename Methods for clarity
+summary_metrics$Method <- recode(summary_metrics$Method,
+                                 "sPLS"  = "mRMR+sPLS",
+                                 "RFE"   = "mRMR+RFE",
+                                 "LASSO" = "mRMR+LASSO")
+
+# -----------------------------
+# Save results safely
+# -----------------------------
+saveRDS(summary_metrics, file = "summary_metrics.rds")   # RDS for R
+write.csv(summary_metrics, "summary_metrics.csv", row.names = FALSE)  # CSV for Excel
+# Optional: Excel file
+# library(writexl)
+# write_xlsx(summary_metrics, path = "summary_metrics.xlsx")
+
+# Print table
+print(summary_metrics)
+````
+
+#VISUALISATION
+````{r}
+library(ggplot2)
+library(dplyr)
+
+# Collect data for plotting
+all_df <- data.frame()
+
+for(nm in names(mRMR_results)){
+  top_feats <- mRMR_results[[nm]]
+  x_train <- t(split_data[[nm]]$train_expr)  # transpose for variance calculation
+  
+  # Compute variance per feature
+  feat_vars <- apply(x_train, 2, var)
+  
+  # Keep only valid features present in top_feats
+  valid_feats <- intersect(top_feats, names(feat_vars))
+  
+  # Build dataset-specific dataframe
+  df_tmp <- data.frame(
+    Dataset = nm,
+    Feature = valid_feats,
+    Rank = seq_along(valid_feats),
+    Variance = feat_vars[valid_feats]
+  )
+  
+  all_df <- bind_rows(all_df, df_tmp)
+}
+
+# Faceted scatter plot
+p_faceted <- ggplot(all_df, aes(x = Rank, y = Variance)) +
+  geom_point(color = "darkred", alpha = 0.5, size = 1.2) +
+  geom_line(color = "steelblue", alpha = 0.7) +
+  facet_wrap(~Dataset, scales = "free_y") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Variance vs. Rank for mRMR-Selected Features",
+    x = "Feature Rank",
+    y = "Feature Variance"
+  )
+
+print(p_faceted)
+
+````
+
+````{r}
+p_overlay <- ggplot(all_df, aes(x = Rank, y = Variance, color = Dataset)) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_line(alpha = 0.7, size = 1) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Variance vs. Rank Across Datasets (mRMR-Selected Features)",
+    x = "Feature Rank",
+    y = "Feature Variance"
+  ) +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank()
+  )
+print(p_overlay)
+````
+
+````{r}
+# Calculate consistency scores
+consistency_data <- summary_metrics %>%
+  group_by(Method) %>%
+  summarise(
+    Mean_AUC = mean(AUC),
+    SD_AUC = sd(AUC),
+    Min_AUC = min(AUC),
+    Max_AUC = max(AUC),
+    Consistency_Score = 1 - (SD_AUC / Mean_AUC)
+  ) %>%
+  arrange(desc(Mean_AUC))
+
+# Plot consistency
+ggplot(consistency_data, aes(x = reorder(Method, Mean_AUC), y = Mean_AUC, fill = Method)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(
+    aes(ymin = Mean_AUC - SD_AUC, ymax = Mean_AUC + SD_AUC),
+    width = 0.2, color = "black"
+  ) +
+  geom_text(
+    aes(label = paste0("Consistency: ", round(Consistency_Score, 3))),
+    hjust = -0.1, size = 3
+  ) +
+  scale_fill_manual(values = c("#FF6B6B", "#4ECDC4", "#45B7D1")) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Method Consistency Across Datasets",
+    x = "Method",
+    y = "Mean AUC ± SD",
+    caption = "Error bars represent standard deviation across datasets"
+  ) +
+  coord_flip()
+````
+
+````{r}
+# Add number of features per dataset/method from your hybrid results
+summary_metrics$Num_Features <- mapply(function(dataset, method){
+  # hybrid_res contains the selected features
+  feats <- hybrid_res[[method]][[dataset]]
+  if(is.null(feats)) return(NA)
+  length(feats)
+}, summary_metrics$Dataset, summary_metrics$Method)
+
+# Now summarise
+final_summary <- summary_metrics %>%
+  group_by(Method) %>%
+  summarise(
+    Avg_Accuracy    = mean(Accuracy, na.rm = TRUE),
+    Avg_Recall      = mean(Sensitivity, na.rm = TRUE),  # Sensitivity ≈ Recall
+    Avg_Specificity = mean(Specificity, na.rm = TRUE),
+    Avg_F1          = mean(F1, na.rm = TRUE),
+    Avg_AUC         = mean(AUC, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Avg_AUC))
+
+# Display nicely formatted table
+library(kableExtra)
+kable(final_summary, caption = "Overall Performance Summary Across All Datasets") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = TRUE, color = "white", background = "#388E3C") %>%
+  column_spec(1, bold = TRUE)
+````
+
+````{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+
+# Define colors for the three methods
+method_colors <- c("#FF6B6B", "#4ECDC4", "#45B7D1") # sPLS, RFE, LASSO
+
+# Create radar plot data
+create_radar_data <- function(performance_df){
+  radar_data <- performance_df %>%
+    dplyr::select(Dataset, Method, Accuracy, Sensitivity, Specificity, F1, AUC) %>%
+    tidyr::pivot_longer(cols = c(Accuracy, Sensitivity, Specificity, F1, AUC),
+                        names_to = "Metric", values_to = "Value") %>%
+    group_by(Dataset, Metric) %>%
+    mutate(Value_scaled = (Value - min(Value)) / (max(Value) - min(Value))) %>%
+    ungroup()
+  radar_data$Metric <- factor(radar_data$Metric, levels = c("Accuracy","Sensitivity","Specificity","F1","AUC"))
+  return(radar_data)
+}
+
+radar_data <- create_radar_data(summary_metrics)  # Use summary_metrics
+
+# Generate plots
+radar_plots <- list()
+for(dataset in unique(radar_data$Dataset)){
+  plot_data <- radar_data %>% filter(Dataset == dataset)
+  p <- ggplot(plot_data, aes(x = Metric, y = Value_scaled, group = Method, color = Method)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    geom_polygon(aes(fill = Method), alpha = 0.1) +
+    scale_color_manual(values = method_colors) +
+    scale_fill_manual(values = method_colors) +
+    coord_polar() +
+    theme_minimal() +
+    labs(title = paste("Performance Radar -", dataset), x = "", y = "Scaled Performance") +
+    theme(legend.position = "right",
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank())
+  radar_plots[[dataset]] <- p
+}
+
+# Arrange radar plots in a grid
+gridExtra::grid.arrange(grobs = radar_plots, ncol = 2)
+````
+
+````{r}
+# Prepare data for boxplot including Precision
+boxplot_data <- summary_metrics %>%
+  dplyr::select(Dataset, Method, Accuracy, Precision, Sensitivity, Specificity, F1, AUC) %>%
+  tidyr::pivot_longer(
+    cols = Accuracy:AUC,   # This now includes Precision automatically
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Create boxplot
+ggplot(boxplot_data, aes(x = Method, y = Value, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_point(position = position_jitter(width = 0.2), alpha = 0.6) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  scale_fill_manual(values = method_colors) +
+  theme_minimal() +
+  labs(title = "Distribution of Performance Metrics by Method",
+       y = "Metric Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+````
+
+````{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(RColorBrewer)
+
+# Function to create a normalized performance heatmap
+create_performance_heatmap <- function(summary_table) {
+  
+  # Ensure numeric metrics exist
+  numeric_cols <- c("Accuracy", "Precision", "Sensitivity", "Specificity", "F1", "AUC")
+  missing_cols <- setdiff(numeric_cols, colnames(summary_table))
+  if(length(missing_cols) > 0){
+    stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+  
+  # Reshape to long format
+  heatmap_data <- summary_table %>%
+    dplyr::select(Dataset, Method, all_of(numeric_cols)) %>%
+    tidyr::pivot_longer(
+      cols = all_of(numeric_cols),
+      names_to = "Metric",
+      values_to = "Value"
+    )
+  
+  # Normalize each metric across all datasets and methods (0-1 scale)
+  heatmap_data <- heatmap_data %>%
+    group_by(Metric) %>%
+    mutate(Normalized = (Value - min(Value, na.rm = TRUE)) /
+                        (max(Value, na.rm = TRUE) - min(Value, na.rm = TRUE))) %>%
+    ungroup()
+  
+  # Optional: order methods consistently
+  heatmap_data$Method <- factor(heatmap_data$Method, levels = c("mRMR+sPLS", "mRMR+RFE", "mRMR+LASSO"))
+  
+  # Order y-axis by Dataset first, then Metric
+  heatmap_data$Dataset_Metric <- factor(
+    paste(heatmap_data$Dataset, heatmap_data$Metric, sep = " - "),
+    levels = unique(paste(heatmap_data$Dataset, heatmap_data$Metric, sep = " - "))
+  )
+  
+  # Plot heatmap
+  ggplot(heatmap_data, aes(x = Method, y = Dataset_Metric, fill = Normalized)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Value, 3)), color = "white", size = 3, fontface = "bold") +
+    scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "Blues")) +
+    labs(
+      title = "Performance Comparison: sPLS vs RFE vs LASSO",
+      subtitle = "Across all datasets and metrics (colors normalized per metric)",
+      x = "Method",
+      y = "Dataset & Metric",
+      fill = "Normalized"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 10)
+    )
+}
+
+# Create and display the heatmap
+performance_heatmap <- create_performance_heatmap(summary_metrics)
+print(performance_heatmap)
+````
+
+```{r}
+create_performance_heatmap <- function(summary_table) {
+  
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(RColorBrewer)
+  
+  # Ensure numeric metrics exist
+  numeric_cols <- c("Accuracy", "Precision", "Sensitivity", "Specificity", "F1", "AUC")
+  missing_cols <- setdiff(numeric_cols, colnames(summary_table))
+  if(length(missing_cols) > 0){
+    stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+  
+  # Replace 1 with 0.998
+  summary_table[numeric_cols] <- summary_table[numeric_cols] %>%
+    lapply(function(x) ifelse(x == 1, 0.998, x))
+  
+  # Reshape to long format
+  heatmap_data <- summary_table %>%
+    dplyr::select(Dataset, Method, all_of(numeric_cols)) %>%
+    tidyr::pivot_longer(
+      cols = all_of(numeric_cols),
+      names_to = "Metric",
+      values_to = "Value"
+    )
+  
+  # Normalize each metric (0-1)
+  heatmap_data <- heatmap_data %>%
+    group_by(Metric) %>%
+    mutate(Normalized = (Value - min(Value, na.rm = TRUE)) /
+                        (max(Value, na.rm = TRUE) - min(Value, na.rm = TRUE))) %>%
+    ungroup()
+  
+  # Order methods
+  heatmap_data$Method <- factor(heatmap_data$Method, levels = c("mRMR+sPLS", "mRMR+RFE", "mRMR+LASSO"))
+  
+  # Combine Dataset & Metric for y-axis
+  heatmap_data$Dataset_Metric <- factor(
+    paste(heatmap_data$Dataset, heatmap_data$Metric, sep = " - "),
+    levels = unique(paste(heatmap_data$Dataset, heatmap_data$Metric, sep = " - "))
+  )
+  
+  # Plot heatmap with dark grey text
+  ggplot(heatmap_data, aes(x = Method, y = Dataset_Metric, fill = Normalized)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Value, 3)), color = "grey20", size = 3, fontface = "bold") +
+    scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "Blues")) +
+    labs(
+      title = "Performance Comparison: sPLS vs RFE vs LASSO",
+      subtitle = "Across all datasets and metrics (colors normalized per metric)",
+      x = "Method",
+      y = "Dataset & Metric",
+      fill = "Normalized"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 10)
+    )
+}
+
+# Create and display the heatmap
+performance_heatmap <- create_performance_heatmap(summary_metrics)
+print(performance_heatmap)
+```
+
+```{r}
+create_performance_heatmap <- function(summary_table) {
+  
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(RColorBrewer)
+  
+  # Ensure numeric metrics exist
+  numeric_cols <- c("Accuracy", "Precision", "Sensitivity", "Specificity", "F1", "AUC")
+  missing_cols <- setdiff(numeric_cols, colnames(summary_table))
+  if(length(missing_cols) > 0){
+    stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+  
+  # Replace 1 with 0.998
+  summary_table[numeric_cols] <- summary_table[numeric_cols] %>%
+    lapply(function(x) ifelse(x == 1, 0.998, x))
+  
+  # Reshape to long format
+  heatmap_data <- summary_table %>%
+    dplyr::select(Dataset, Method, all_of(numeric_cols)) %>%
+    tidyr::pivot_longer(
+      cols = all_of(numeric_cols),
+      names_to = "Metric",
+      values_to = "Value"
+    )
+  
+  # Normalize each metric (0-1)
+  heatmap_data <- heatmap_data %>%
+    group_by(Metric) %>%
+    mutate(Normalized = (Value - min(Value, na.rm = TRUE)) /
+                        (max(Value, na.rm = TRUE) - min(Value, na.rm = TRUE))) %>%
+    ungroup()
+  
+  # Order methods
+  heatmap_data$Method <- factor(heatmap_data$Method, levels = c("mRMR+sPLS", "mRMR+RFE", "mRMR+LASSO"))
+  
+  # Combine Dataset & Metric for y-axis
+  heatmap_data$Dataset_Metric <- factor(
+    paste(heatmap_data$Dataset, heatmap_data$Metric, sep = " - "),
+    levels = unique(paste(heatmap_data$Dataset, heatmap_data$Metric, sep = " - "))
+  )
+  
+  # Plot heatmap (without probabilities written inside)
+  ggplot(heatmap_data, aes(x = Method, y = Dataset_Metric, fill = Normalized)) +
+    geom_tile(color = "white") +
+    scale_fill_gradientn(colors = RColorBrewer::brewer.pal(9, "Blues")) +
+    labs(
+      title = "Performance Comparison: sPLS vs RFE vs LASSO",
+      subtitle = "Across all datasets and metrics (colors normalized per metric)",
+      x = "Method",
+      y = "Dataset & Metric",
+      fill = "Normalized"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 10)
+    )
+}
+
+# Create and display the heatmap
+performance_heatmap <- create_performance_heatmap(summary_metrics)
+print(performance_heatmap)
+```
+
+
+#FURTHER CLASSIFICATION 
+```{r}
+# ================================================================
+# Additional Classifiers with mRMR+RFE Features
+# ================================================================
+library(e1071)   # Naive Bayes
+library(kernlab) # SVM
+library(caret)
+library(pROC)
+set.seed(1996)
+
+additional_results <- data.frame()
+
+for(nm in names(split_data)) {
+  
+  # Use only features selected by mRMR + RFE
+  features <- hybrid_res[["RFE"]][[nm]]
+  
+  if(is.null(features) || length(features) < 2){
+    warning("Too few features for dataset ", nm, "- skipping additional classifiers.")
+    next
+  }
+  
+  # Subset train/test matrices
+  x_train <- t(split_data[[nm]]$train_expr[features, , drop = FALSE])
+  y_train <- split_data[[nm]]$train_labels
+  x_test  <- t(split_data[[nm]]$test_expr[features, , drop = FALSE])
+  y_test  <- split_data[[nm]]$test_labels
+  
+  train_df <- data.frame(Class = y_train, x_train)
+  test_df  <- data.frame(x_test)
+  
+  # -------------------------
+  # SVM Classifier
+  # -------------------------
+  svm_model <- ksvm(x = as.matrix(x_train), y = y_train,
+                    type = "C-svc", kernel = "rbfdot", prob.model = TRUE)
+  
+  svm_probs <- predict(svm_model, as.matrix(x_test), type = "probabilities")[,"Tumor"]
+  svm_pred  <- factor(ifelse(svm_probs > 0.5, "Tumor", "Normal"), levels = c("Normal","Tumor"))
+  
+  svm_roc <- roc(y_test, svm_probs)
+  
+  additional_results <- rbind(additional_results, data.frame(
+    Dataset = nm,
+    Classifier = "SVM",
+    Accuracy = mean(svm_pred == y_test),
+    Precision = posPredValue(svm_pred, y_test, positive = "Tumor"),
+    Recall = sensitivity(svm_pred, y_test),
+    Specificity = specificity(svm_pred, y_test),
+    F1 = F_meas(svm_pred, y_test),
+    AUC = as.numeric(auc(svm_roc))
+  ))
+  
+  # -------------------------
+  # Naive Bayes Classifier
+  # -------------------------
+  nb_model <- naiveBayes(Class ~ ., data = train_df)
+  
+  nb_probs <- predict(nb_model, test_df, type = "raw")[,"Tumor"]
+  nb_pred  <- factor(ifelse(nb_probs > 0.5, "Tumor", "Normal"), levels = c("Normal","Tumor"))
+  
+  nb_roc <- roc(y_test, nb_probs)
+  
+  additional_results <- rbind(additional_results, data.frame(
+    Dataset = nm,
+    Classifier = "NaiveBayes",
+    Accuracy = mean(nb_pred == y_test),
+    Precision = posPredValue(nb_pred, y_test, positive = "Tumor"),
+    Recall = sensitivity(nb_pred, y_test),
+    Specificity = specificity(nb_pred, y_test),
+    F1 = F_meas(nb_pred, y_test),
+    AUC = as.numeric(auc(nb_roc))
+  ))
+}
+
+# -------------------------
+# After loop: reorder, save, print
+# -------------------------
+additional_results <- additional_results[, c("Dataset","Classifier","Accuracy","Precision","Recall","Specificity","F1","AUC")]
+
+saveRDS(additional_results, "additional_classifiers_RFE.rds")
+write.csv(additional_results, "additional_classifiers_RFE.csv", row.names = FALSE)
+
+print(additional_results)
+
+```
+
+````{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Load your results if needed
+# additional_results <- readRDS("additional_classifiers_RFE.rds")
+
+# Pivot data longer for ggplot
+boxplot_data <- additional_results %>%
+  pivot_longer(
+    cols = Accuracy:AUC,       # all metrics
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Optional: define colors for classifiers
+method_colors <- c("SVM" = "#1f77b4", "NaiveBayes" = "#ff7f0e", "Logistic" = "#2ca02c")
+
+# Create boxplot
+ggplot(boxplot_data, aes(x = Classifier, y = Value, fill = Classifier)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.6, color = "black", size = 1.5) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  scale_fill_manual(values = method_colors) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Distribution of Classification Metrics Across Classifiers",
+       y = "Metric Value", x = "Classifier") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+````
+````{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# -------------------------
+# 1. Prepare logistic results from summary_metrics
+# -------------------------
+logistic_results <- summary_metrics %>%
+  rename(Recall = Sensitivity) %>%   # Rename Sensitivity to Recall
+  dplyr::select(Dataset, Classifier = Method, Accuracy, Recall, Specificity, F1, AUC) %>%
+  mutate(
+    Accuracy    = as.numeric(Accuracy),
+    Recall      = as.numeric(Recall),
+    Specificity = as.numeric(Specificity),
+    F1          = as.numeric(F1),
+    AUC         = as.numeric(AUC),
+    Precision   = ifelse(is.na(F1) | F1 == 0 | Recall == 0, NA, F1 * (Accuracy / Recall))
+  )
+
+# Recode method name for clarity
+logistic_results$Classifier <- "Logistic"
+
+# -------------------------
+# 2. Combine with additional_results
+# -------------------------
+all_results <- bind_rows(additional_results, logistic_results)
+
+# -------------------------
+# 3. Pivot for ggplot
+# -------------------------
+boxplot_data <- all_results %>%
+  pivot_longer(
+    cols = Accuracy:AUC,
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# -------------------------
+# 4. Define colors
+# -------------------------
+method_colors <- c("SVM" = "#1f77b4", "NaiveBayes" = "#ff7f0e", "Logistic" = "#2ca02c")
+
+# -------------------------
+# 5. Create boxplot
+# -------------------------
+ggplot(boxplot_data, aes(x = Classifier, y = Value, fill = Classifier)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.6, color = "black", size = 1.5) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  scale_fill_manual(values = method_colors) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Distribution of Classification Metrics Across Classifiers",
+       y = "Metric Value", x = "Classifier") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+````
+
+````{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# -------------------------
+# 1. Prepare logistic results
+# -------------------------
+logistic_results <- summary_metrics %>%
+  rename(Recall = Sensitivity) %>%
+  select(Dataset, Classifier = Method, Accuracy, Recall, Specificity, F1, AUC) %>%
+  mutate(
+    Accuracy    = as.numeric(Accuracy),
+    Recall      = as.numeric(Recall),
+    Specificity = as.numeric(Specificity),
+    F1          = as.numeric(F1),
+    AUC         = as.numeric(AUC),
+    Precision   = ifelse(is.na(F1) | F1 == 0 | Recall == 0, NA, F1 * (Accuracy / Recall))
+  )
+
+logistic_results$Classifier <- "Logistic"
+
+# -------------------------
+# 2. Combine with additional_results
+# -------------------------
+all_results <- bind_rows(additional_results, logistic_results)
+
+# -------------------------
+# 3. Pivot for ggplot
+# -------------------------
+boxplot_data <- all_results %>%
+  pivot_longer(
+    cols = Accuracy:AUC,
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# -------------------------
+# 4. Define colours
+# -------------------------
+method_colors <- c(
+  "Logistic"   = "red",
+  "SVM"        = "green",
+  "NaiveBayes" = "blue"
+)
+
+# -------------------------
+# 5. Create boxplot (no title/subtitle)
+# -------------------------
+boxplot_plot <- ggplot(boxplot_data, aes(x = Classifier, y = Value, fill = Classifier)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.6, color = "black", size = 1.5) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  scale_fill_manual(values = method_colors) +
+  theme_minimal(base_size = 14) +
+  labs(x = "Classifier", y = "Metric Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# -------------------------
+# 6. Save as PDF
+# -------------------------
+ggsave("Classifier_Boxplots.pdf", plot = boxplot_plot, width = 10, height = 6, units = "in")
+````
+
+
+
+````{r}
+# ================================================================
+# Full Workflow: Combine Classifiers and Plot Metrics
+# ================================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)
+library(e1071)   # Naive Bayes
+library(kernlab) # SVM
+library(glmnet)
+library(pROC)
+
+set.seed(1996)
+
+# -------------------------
+# 1. Prepare additional classifiers (SVM, Naive Bayes)
+# -------------------------
+additional_results <- data.frame()
+
+for(nm in names(split_data)) {
+  
+  features <- hybrid_res[["RFE"]][[nm]]
+  
+  if(is.null(features) || length(features) < 2){
+    warning("Too few features for dataset ", nm, "- skipping additional classifiers.")
+    next
+  }
+  
+  x_train <- t(split_data[[nm]]$train_expr[features, , drop = FALSE])
+  x_test  <- t(split_data[[nm]]$test_expr[features, , drop = FALSE])
+  y_train <- split_data[[nm]]$train_labels
+  y_test  <- split_data[[nm]]$test_labels
+  
+  train_df <- data.frame(Class = y_train, x_train)
+  test_df  <- data.frame(x_test)
+  
+  # --- SVM ---
+  svm_model <- ksvm(as.matrix(x_train), y_train,
+                    type = "C-svc", kernel = "rbfdot", prob.model = TRUE)
+  svm_probs <- predict(svm_model, as.matrix(x_test), type = "probabilities")[,"Tumor"]
+  svm_pred  <- factor(ifelse(svm_probs > 0.5, "Tumor", "Normal"), levels = c("Normal","Tumor"))
+  svm_roc   <- roc(y_test, svm_probs)
+  
+  additional_results <- rbind(additional_results, data.frame(
+    Dataset = nm,
+    Classifier = "SVM",
+    Accuracy = mean(svm_pred == y_test),
+    Precision = posPredValue(svm_pred, y_test, positive = "Tumor"),
+    Recall = sensitivity(svm_pred, y_test),
+    Specificity = specificity(svm_pred, y_test),
+    F1 = F_meas(svm_pred, y_test),
+    AUC = as.numeric(auc(svm_roc))
+  ))
+  
+  # --- Naive Bayes ---
+  nb_model <- naiveBayes(Class ~ ., data = train_df)
+  nb_probs <- predict(nb_model, test_df, type = "raw")[,"Tumor"]
+  nb_pred  <- factor(ifelse(nb_probs > 0.5, "Tumor", "Normal"), levels = c("Normal","Tumor"))
+  nb_roc   <- roc(y_test, nb_probs)
+  
+  additional_results <- rbind(additional_results, data.frame(
+    Dataset = nm,
+    Classifier = "NaiveBayes",
+    Accuracy = mean(nb_pred == y_test),
+    Precision = posPredValue(nb_pred, y_test, positive = "Tumor"),
+    Recall = sensitivity(nb_pred, y_test),
+    Specificity = specificity(nb_pred, y_test),
+    F1 = F_meas(nb_pred, y_test),
+    AUC = as.numeric(auc(nb_roc))
+  ))
+}
+
+# -------------------------
+# 2. Add previous Logistic regression results
+# -------------------------
+logistic_results <- summary_metrics %>%
+  # Rename Sensitivity -> Recall
+  rename(Recall = Sensitivity) %>%
+  dplyr::select(Dataset, Classifier = Method, Accuracy, Recall, Specificity, F1, AUC) %>%
+  # Ensure numeric for calculations
+  mutate(
+    Accuracy    = as.numeric(Accuracy),
+    Recall      = as.numeric(Recall),
+    Specificity = as.numeric(Specificity),
+    F1          = as.numeric(F1),
+    AUC         = as.numeric(AUC),
+    Precision   = ifelse(is.na(F1) | F1 == 0 | Recall == 0, NA, F1 * (Accuracy / Recall))
+  )
+
+# Recode logistic method name for clarity
+logistic_results$Classifier <- "Logistic"
+
+# -------------------------
+# 3. Combine all classifiers
+# -------------------------
+combined_results <- bind_rows(additional_results, logistic_results)
+
+# Ensure proper order of metrics
+combined_results <- combined_results[, c("Dataset","Classifier","Accuracy","Precision","Recall","Specificity","F1","AUC")]
+
+# -------------------------
+# 4. Prepare data for boxplots
+# -------------------------
+boxplot_data <- combined_results %>%
+  pivot_longer(
+    cols = Accuracy:AUC,
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Classifier colors
+method_colors <- c("SVM" = "#1f77b4", "NaiveBayes" = "#ff7f0e", "Logistic" = "#2ca02c")
+
+# -------------------------
+# 5. Plot faceted boxplots (facet by Dataset and Metric)
+# -------------------------
+ggplot(boxplot_data, aes(x = Classifier, y = Value, fill = Classifier)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.6, color = "black", size = 1.5) +
+  facet_grid(Dataset ~ Metric, scales = "free_y") +
+  scale_fill_manual(values = method_colors) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Distribution of Classification Metrics Across Datasets and Methods",
+       y = "Metric Value", x = "Classifier") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# -------------------------
+# 6. Save combined results
+# -------------------------
+saveRDS(combined_results, "combined_classification_results.rds")
+write.csv(combined_results, "combined_classification_results.csv", row.names = FALSE)
+````
+
+
+````{r}
+set.seed(1996)
+library(kernlab)
+library(e1071)
+library(pROC)
+library(ggplot2)
+library(caret)
+
+# Initialize a dataframe to hold all ROC curves and metrics
+roc_combined_df <- data.frame()
+metrics_df      <- data.frame()
+
+for(nm in names(split_data)) {
+  
+  # Use only top mRMR+LASSO features
+  features <- hybrid_res[["LASSO"]][[nm]]
+  if(is.null(features) || length(features) < 2) next
+  
+  # Subset train/test matrices
+  x_train <- t(split_data[[nm]]$train_expr[features, , drop = FALSE])
+  y_train <- split_data[[nm]]$train_labels
+  x_test  <- t(split_data[[nm]]$test_expr[features, , drop = FALSE])
+  y_test  <- split_data[[nm]]$test_labels
+  
+  df_list <- list()
+  
+  # -------------------------
+  # Logistic Regression
+  # -------------------------
+  log_model <- suppressWarnings(
+    glm(Class ~ ., data = data.frame(Class = y_train, x_train), family = "binomial")
+  )
+  log_prob <- predict(log_model, newdata = data.frame(x_test), type = "response")
+  log_pred <- factor(ifelse(log_prob > 0.5, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+  
+  # ROC data
+  roc_obj <- roc(y_test, log_prob, quiet = TRUE)
+  df_list[["Logistic"]] <- data.frame(
+    Dataset = nm,
+    Specificity = 1 - roc_obj$specificities,
+    Sensitivity = roc_obj$sensitivities,
+    Classifier = "Logistic"
+  )
+  
+  # Metrics
+  metrics_df <- rbind(metrics_df, data.frame(
+    Dataset   = nm,
+    Classifier= "Logistic",
+    Accuracy  = mean(log_pred == y_test),
+    Precision = posPredValue(log_pred, y_test, positive = "Tumor"),
+    Recall    = sensitivity(log_pred, y_test),
+    Specificity = specificity(log_pred, y_test),
+    F1        = F_meas(log_pred, y_test),
+    AUC       = as.numeric(auc(roc_obj))
+  ))
+  
+  # -------------------------
+  # SVM
+  # -------------------------
+  svm_model <- ksvm(as.matrix(x_train), y_train, type = "C-svc", kernel = "rbfdot", prob.model = TRUE)
+  svm_prob  <- predict(svm_model, as.matrix(x_test), type = "probabilities")[,"Tumor"]
+  svm_pred  <- factor(ifelse(svm_prob > 0.5, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+  
+  roc_obj <- roc(y_test, svm_prob, quiet = TRUE)
+  df_list[["SVM"]] <- data.frame(
+    Dataset = nm,
+    Specificity = 1 - roc_obj$specificities,
+    Sensitivity = roc_obj$sensitivities,
+    Classifier = "SVM"
+  )
+  
+  metrics_df <- rbind(metrics_df, data.frame(
+    Dataset   = nm,
+    Classifier= "SVM",
+    Accuracy  = mean(svm_pred == y_test),
+    Precision = posPredValue(svm_pred, y_test, positive = "Tumor"),
+    Recall    = sensitivity(svm_pred, y_test),
+    Specificity = specificity(svm_pred, y_test),
+    F1        = F_meas(svm_pred, y_test),
+    AUC       = as.numeric(auc(roc_obj))
+  ))
+  
+  # -------------------------
+  # Naive Bayes
+  # -------------------------
+  nb_model <- naiveBayes(Class ~ ., data = data.frame(Class = y_train, x_train))
+  nb_prob  <- predict(nb_model, data.frame(x_test), type = "raw")[,"Tumor"]
+  nb_pred  <- factor(ifelse(nb_prob > 0.5, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+  
+  roc_obj <- roc(y_test, nb_prob, quiet = TRUE)
+  df_list[["NaiveBayes"]] <- data.frame(
+    Dataset = nm,
+    Specificity = 1 - roc_obj$specificities,
+    Sensitivity = roc_obj$sensitivities,
+    Classifier = "NaiveBayes"
+  )
+  
+  metrics_df <- rbind(metrics_df, data.frame(
+    Dataset   = nm,
+    Classifier= "NaiveBayes",
+    Accuracy  = mean(nb_pred == y_test),
+    Precision = posPredValue(nb_pred, y_test, positive = "Tumor"),
+    Recall    = sensitivity(nb_pred, y_test),
+    Specificity = specificity(nb_pred, y_test),
+    F1        = F_meas(nb_pred, y_test),
+    AUC       = as.numeric(auc(roc_obj))
+  ))
+  
+  # Combine ROC curves for this dataset
+  roc_combined_df <- rbind(roc_combined_df, do.call(rbind, df_list))
+}
+
+# -------------------------
+# Faceted ROC Plot
+# -------------------------
+ggplot(roc_combined_df, aes(x = Specificity, y = Sensitivity, color = Classifier)) +
+  geom_line(size = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  facet_wrap(~Dataset) +
+  theme_minimal() +
+  labs(title = "ROC Curves by Dataset (Top Features: mRMR+LASSO)",
+       x = "1 - Specificity", y = "Sensitivity") +
+  scale_color_manual(values = c("Logistic" = "#FF6B6B",
+                                "SVM" = "#4ECDC4",
+                                "NaiveBayes" = "#45B7D1")) +
+  theme(legend.position = "top")
+
+# Save metrics for downstream use
+saveRDS(metrics_df, "additional_classifiers_LASSO_metrics.rds")
+write.csv(metrics_df, "additional_classifiers_LASSO_metrics.csv", row.names = FALSE)
+
+# Print metrics
+print(metrics_df)
+````
+````{r}
+library(dplyr)
+library(ggplot2)
+
+# Ensure Logistic Regression and Naive Bayes names are consistent
+auc_summary <- metrics_df %>%  # or combined_results if you already have it
+  mutate(Classifier = case_when(
+    Classifier %in% c("Logistic", "LogisticRegression") ~ "Logistic",
+    Classifier %in% c("Naive Bayes", "NaiveBayes") ~ "NaiveBayes",
+    TRUE ~ as.character(Classifier)
+  )) %>%
+  group_by(Dataset, Classifier) %>%
+  summarise(
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SE_AUC = sd(AUC, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Plot Mean AUC ± 95% CI
+ggplot(auc_summary, aes(x = Dataset, y = Mean_AUC, color = Classifier, group = Classifier)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), size = 1) +
+  geom_errorbar(aes(ymin = Mean_AUC - 1.96 * SE_AUC, ymax = Mean_AUC + 1.96 * SE_AUC),
+                width = 0.2, position = position_dodge(0.3)) +
+  scale_color_manual(values = c(
+    "Logistic" = "#E41A1C",  # red
+    "SVM"      = "#377EB8",  # blue
+    "NaiveBayes" = "#4DAF4A" # green
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Mean AUC ± 95% CI by Classifier and Dataset",
+    x = "Dataset",
+    y = "Mean AUC ± 95% CI"
+  ) +
+  theme(legend.position = "top")
+````
+````{r}
+library(dplyr)
+library(ggplot2)
+
+# Ensure Logistic Regression and Naive Bayes names are consistent
+auc_summary <- metrics_df %>%
+  mutate(Classifier = case_when(
+    Classifier %in% c("Logistic", "LogisticRegression") ~ "Logistic",
+    Classifier %in% c("Naive Bayes", "NaiveBayes") ~ "NaiveBayes",
+    TRUE ~ as.character(Classifier)
+  )) %>%
+  group_by(Dataset, Classifier) %>%
+  summarise(
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SE_AUC = sd(AUC, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Create plot
+auc_plot <- ggplot(auc_summary, aes(x = Dataset, y = Mean_AUC, color = Classifier, group = Classifier)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), size = 1) +
+  geom_errorbar(aes(ymin = Mean_AUC - 1.96 * SE_AUC, ymax = Mean_AUC + 1.96 * SE_AUC),
+                width = 0.2, position = position_dodge(0.3)) +
+  scale_color_manual(values = c(
+    "Logistic"   = "red",
+    "SVM"        = "green",
+    "NaiveBayes" = "blue"
+  )) +
+  theme_minimal() +
+  labs(
+    x = "Dataset",
+    y = "Mean AUC ± 95% CI"
+  ) +
+  theme(legend.position = "top")
+
+ggsave("Mean_AUC_plot_no_title.pdf", plot = auc_plot, width = 8, height = 6, units = "in")
+````
+
+
+
+
+
+````{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(gridExtra) # optional for spacing control
+
+create_shap_dependence_faceted <- function(shap_results, importance_data, n_features = 3) {
+  
+  # Build long-format SHAP + feature values
+  shap_long_data <- map_dfr(names(shap_results), function(dataset_name) {
+    res <- shap_results[[dataset_name]]
+    if (is.null(res)) return(data.frame())
+    
+    # SHAP long
+    shap_df <- as.data.frame(res$shap_matrix)
+    shap_df$Sample <- rownames(shap_df)
+    shap_long <- shap_df %>%
+      pivot_longer(cols = -Sample, names_to = "Feature", values_to = "SHAP")
+    
+    # Feature long
+    feature_df <- as.data.frame(res$feature_values)
+    feature_df$Sample <- rownames(feature_df)
+    feature_long <- feature_df %>%
+      pivot_longer(cols = -Sample, names_to = "Feature", values_to = "Feature_Value")
+    
+    # Merge
+    inner_join(shap_long, feature_long, by = c("Sample", "Feature")) %>%
+      mutate(Dataset = dataset_name)
+  })
+  
+  # Select top n_features per dataset
+  top_features <- importance_data %>%
+    group_by(Dataset) %>%
+    filter(Rank <= n_features) %>%
+    ungroup()
+  
+  dependence_data <- shap_long_data %>%
+    inner_join(top_features, by = c("Dataset", "Feature"))
+  
+  if (nrow(dependence_data) == 0) {
+    warning("No matching features found.")
+    return(NULL)
+  }
+  
+  # Create a combined label for facetting (2x2 layout)
+  dependence_data <- dependence_data %>%
+    mutate(Facet_Label = paste0(Dataset, " | ", Feature))
+  
+  # Generate plot
+  p <- ggplot(dependence_data, aes(x = Feature_Value, y = SHAP)) +
+    geom_point(alpha = 0.4, color = "steelblue", size = 1) +
+    geom_smooth(method = "loess", color = "red", se = FALSE, size = 0.8) +
+    facet_wrap(~Facet_Label, ncol = 2, scales = "free") +
+    theme_minimal() +
+    labs(
+      title = paste0("SHAP Dependence Plots - Top ", n_features, " Features per Dataset"),
+      x = "Feature Value",
+      y = "SHAP Value (Impact on Prediction)"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      strip.text = element_text(size = 9),
+      panel.spacing = unit(1, "lines")
+    )
+  
+  return(list(plot = p, data = dependence_data))
+}
+
+# Usage example
+result <- create_shap_dependence_faceted(shap_results, importance_data, n_features = 3)
+print(result$plot)
+ggsave("SHAP_dependence_faceted.png", result$plot, width = 10, height = 8, dpi = 300)
+````
+
+````{r}
+library(ggplot2)
+library(dplyr)
+
+# 4. FACETED: Cross-dataset Consensus Heatmap
+consensus_heatmap_data <- importance_data %>%
+  filter(Rank <= 15) %>%            # Top 15 genes from each dataset
+  mutate(Importance_Score = 1 / Rank)  # Convert rank to score (lower rank = higher score)
+
+# Heatmap plot
+p_consensus <- ggplot(consensus_heatmap_data,
+                      aes(x = Dataset,
+                          y = reorder(Feature, Mean_ABS_SHAP),
+                          fill = Importance_Score)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Rank), color = "white", size = 3, fontface = "bold") +
+  scale_fill_gradient(low = "#FEE08B", high = "#D73027",
+                      name = "Importance\nScore") +
+  theme_minimal() +
+  labs(title = "Top Gene Importance Across All Datasets",
+       subtitle = "Ranking of most important genes (Lower number = More Important)",
+       x = "Dataset",
+       y = "Gene") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10)
+  )
+
+print(p_consensus)
+
+# Save figure
+ggsave("Consensus_Heatmap_Top15Genes.png", p_consensus, width = 10, height = 8, dpi = 300)
+````
+````{r}
+library(ggplot2)
+library(dplyr)
+
+# 5. FACETED: Overall Importance Distribution
+p_distribution <- ggplot(
+  importance_data %>% filter(Rank <= 20),
+  aes(x = as.factor(Rank), y = Mean_ABS_SHAP, fill = Dataset)
+) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~Dataset, ncol = 2) +
+  scale_fill_manual(values = c("#FF6B6B", "#4ECDC4", "#45B7D1", "#F9A602")) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of SHAP Importance by Rank",
+    subtitle = "How importance scores distribute across different rank positions",
+    x = "Rank",
+    y = "Mean |SHAP value|"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10)
+  )
+
+print(p_distribution)
+
+# Save the plot
+ggsave("SHAP_Importance_Distribution.png", p_distribution, width = 10, height = 6, dpi = 300)
+````
+
+
+
+
+
+
+
+
